@@ -30,7 +30,7 @@ if __name__ == '__main__':
         env = gym.make("CartPole-v0")
         chief = True
         # Create all the functions necessary to train the model
-        act, train, update_target, update_weights, debug = deepq.build_train(
+        act, train, global_opt, update_target, update_weights, debug = deepq.build_train(
             make_obs_ph=lambda name: U.BatchInput(env.observation_space.shape, name=name),
             q_func=model,
             num_actions=env.action_space.n,
@@ -45,8 +45,10 @@ if __name__ == '__main__':
 
         # Initialize the parameters and copy them to the target network.
         U.initialize()
-        update_weights()
+        t_global_old = update_weights()[0][0]
         update_target()
+        # grad_sum = 0  # TODO The fact that this turns into a np.matrix upon add-assign (+=) is why python is good :)
+        t_start = 0
 
         episode_rewards = [0.0]
         obs = env.reset()
@@ -60,6 +62,8 @@ if __name__ == '__main__':
 
             episode_rewards[-1] += rew
             if done:
+                if len(episode_rewards) % 10 == 0:
+                    env.render()
                 obs = env.reset()
                 episode_rewards.append(0)
 
@@ -69,21 +73,34 @@ if __name__ == '__main__':
                 env.render()
             else:
                 # Minimize the error in Bellman's equation on a batch sampled from replay buffer.
-                gradients = []
-                if t > 1000:
+                if t >= 1000:
                     obses_t, actions, rewards, obses_tp1, dones = replay_buffer.sample(32)
-                    td_error, gradient = train(obses_t, actions, rewards, obses_tp1, dones, np.ones_like(rewards))
-                    gradients.append(gradient)
-                    # for n in gradient:
-                    #     print("\nGradientOuterTuple", t, ":", np.shape(n), ":")
-                    #     for i in n:
-                    #          print("\nGradient", np.shape(i), ":", i)
-                    # if t >= 1002:
-                    #     break
+                    td_error = train(obses_t, actions, rewards, obses_tp1, dones, np.ones_like(rewards))
+
+                    # td_error, gradient = train(obses_t, actions, rewards, obses_tp1, dones, np.ones_like(rewards))
+                    # grad_sum += np.matrix([g for g, _ in gradient])
+
+                    # TODO What should trigger this global opt? just every n iterations? every ep?
+                    if t - t_start >= 100:  # The number of local timesteps to calculate before averaging gradients
+                        # print("t = {}, Updating global network (t_global = {})".format(t, debug['t_global']()[0]))
+
+                        # Turn gradients back to list
+                        # grad_sum = grad_sum.tolist()[0]
+
+                        # Apply gradients to weights in PS
+                        # global_opt(grad_sum)
+                        global_opt([t - t_start], [t_global_old])
+
+                        # Update the local weights with the new global weights from PS
+                        t_global_old = update_weights()[0][0]
+
+                        # TODO Update the target here too? Or just continue its normal cycle but with very old weights
+                        # Reset all variables related to the global weights cycle and update
+                        # grad_sum = 0
+                        t_start = t
 
                 # Update target network periodically.
                 if t % 1000 == 0:
-                    # update_weights() # Weights are always at t0 right now... need to apply gradients to them too
                     update_target()
 
             if done and len(episode_rewards) % 10 == 0:
