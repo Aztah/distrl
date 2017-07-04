@@ -71,7 +71,7 @@ import tensorflow as tf
 import baselines.common.tf_util as U
 
 
-def build_act(make_obs_ph, q_func, num_actions, scope="deepq", reuse=None):
+def build_act(make_obs_ph, q_func, num_actions, scope="deepq", reuse=None, task=0):
     """Creates the act function:
 
     Parameters
@@ -102,32 +102,33 @@ def build_act(make_obs_ph, q_func, num_actions, scope="deepq", reuse=None):
 `       See the top of the file for details.
     """
     with tf.variable_scope(scope, reuse=reuse):
-        observations_ph = U.ensure_tf_input(make_obs_ph("observation"))
-        stochastic_ph = tf.placeholder(tf.bool, (), name="stochastic")
-        update_eps_ph = tf.placeholder(tf.float32, (), name="update_eps")
+        with tf.device("/job:worker/task:{}".format(task)):
+            observations_ph = U.ensure_tf_input(make_obs_ph("observation"))
+            stochastic_ph = tf.placeholder(tf.bool, (), name="stochastic")
+            update_eps_ph = tf.placeholder(tf.float32, (), name="update_eps")
 
-        eps = tf.get_variable("eps", (), initializer=tf.constant_initializer(0))
+            eps = tf.get_variable("eps", (), initializer=tf.constant_initializer(0))
 
-        q_values = q_func(observations_ph.get(), num_actions, scope="q_func")
-        deterministic_actions = tf.argmax(q_values, axis=1)
+            q_values = q_func(observations_ph.get(), num_actions, scope="q_func")
+            deterministic_actions = tf.argmax(q_values, axis=1)
 
-        batch_size = tf.shape(observations_ph.get())[0]
-        random_actions = tf.random_uniform(tf.stack([batch_size]), minval=0, maxval=num_actions, dtype=tf.int64)
-        chose_random = tf.random_uniform(tf.stack([batch_size]), minval=0, maxval=1, dtype=tf.float32) < eps
-        stochastic_actions = tf.where(chose_random, random_actions, deterministic_actions)
+            batch_size = tf.shape(observations_ph.get())[0]
+            random_actions = tf.random_uniform(tf.stack([batch_size]), minval=0, maxval=num_actions, dtype=tf.int64)
+            chose_random = tf.random_uniform(tf.stack([batch_size]), minval=0, maxval=1, dtype=tf.float32) < eps
+            stochastic_actions = tf.where(chose_random, random_actions, deterministic_actions)
 
-        output_actions = tf.cond(stochastic_ph, lambda: stochastic_actions, lambda: deterministic_actions)
-        update_eps_expr = eps.assign(tf.cond(update_eps_ph >= 0, lambda: update_eps_ph, lambda: eps))
+            output_actions = tf.cond(stochastic_ph, lambda: stochastic_actions, lambda: deterministic_actions)
+            update_eps_expr = eps.assign(tf.cond(update_eps_ph >= 0, lambda: update_eps_ph, lambda: eps))
 
-        act = U.function(inputs=[observations_ph, stochastic_ph, update_eps_ph],
-                         outputs=output_actions,
-                         givens={update_eps_ph: -1.0, stochastic_ph: True},
-                         updates=[update_eps_expr])
-        return act
+            act = U.function(inputs=[observations_ph, stochastic_ph, update_eps_ph],
+                             outputs=output_actions,
+                             givens={update_eps_ph: -1.0, stochastic_ph: True},
+                             updates=[update_eps_expr])
+            return act
 
 
-def build_train(make_obs_ph, q_func, num_actions, optimizer, chief=False, grad_norm_clipping=None, gamma=1.0,
-                double_q=True, scope="deepq", reuse=None):
+def build_train(make_obs_ph, q_func, num_actions, optimizer, chief=False, server=None, grad_norm_clipping=None,
+                gamma=1.0, double_q=True, scope="deepq", reuse=None):
     """Creates the act function:
 
     Parameters
@@ -179,149 +180,172 @@ def build_train(make_obs_ph, q_func, num_actions, optimizer, chief=False, grad_n
     debug: {str: function}
         a bunch of functions to print debug data like q_values.
     """
-    act_f = build_act(make_obs_ph, q_func, num_actions, scope=scope, reuse=reuse)
+    task = server.server_def.task_index
+    act_f = build_act(make_obs_ph, q_func, num_actions, scope=scope, reuse=reuse, task=task)
 
     with tf.variable_scope(scope, reuse=reuse):
-        # set up placeholders
-        obs_t_input = U.ensure_tf_input(make_obs_ph("obs_t"))
-        act_t_ph = tf.placeholder(tf.int32, [None], name="action")
-        rew_t_ph = tf.placeholder(tf.float32, [None], name="reward")
-        obs_tp1_input = U.ensure_tf_input(make_obs_ph("obs_tp1"))
-        done_mask_ph = tf.placeholder(tf.float32, [None], name="done")
-        importance_weights_ph = tf.placeholder(tf.float32, [None], name="weight")
+        with tf.device("/job:worker/task:{}".format(task)):
+            # set up placeholders
+            obs_t_input = U.ensure_tf_input(make_obs_ph("obs_t"))
+            act_t_ph = tf.placeholder(tf.int32, [None], name="action")
+            rew_t_ph = tf.placeholder(tf.float32, [None], name="reward")
+            obs_tp1_input = U.ensure_tf_input(make_obs_ph("obs_tp1"))
+            done_mask_ph = tf.placeholder(tf.float32, [None], name="done")
+            importance_weights_ph = tf.placeholder(tf.float32, [None], name="weight")
 
-        # Local timestep counters
-        t = tf.placeholder(tf.float32, [1], name="t")
-        t_global_old = tf.placeholder(tf.float32, [1], name="t_global_old")
+            # Local timestep counters
+            t = tf.placeholder(tf.float32, [1], name="t")
+            t_global_old = tf.placeholder(tf.float32, [1], name="t_global_old")
 
-        # Global timestep counter
-        # TODO Does TF have built-in global step counters?
-        t_global = tf.Variable(dtype=tf.float32, initial_value=[0], name="t_global")
+            # Global timestep counter
+            # TODO Does TF have built-in global step counters?
+            with tf.device("/job:ps/task:0"):
+                t_global = tf.Variable(dtype=tf.float32, initial_value=[0], name="t_global")
 
-        # q network evaluation
-        q_t = q_func(obs_t_input.get(), num_actions, scope="q_func", reuse=True)  # reuse parameters from act
-        q_func_vars = U.scope_vars(U.absolute_scope_name("q_func"))
+            # q network evaluation
+            q_t = q_func(obs_t_input.get(), num_actions, scope="q_func", reuse=True)  # reuse parameters from act
+            q_func_vars = U.scope_vars(U.absolute_scope_name("q_func"))
 
-        # target q network evalution
-        q_tp1 = q_func(obs_tp1_input.get(), num_actions, scope="target_q_func")
-        target_q_func_vars = U.scope_vars(U.absolute_scope_name("target_q_func"))
+            # target q network evalution
+            q_tp1 = q_func(obs_tp1_input.get(), num_actions, scope="target_q_func")
+            target_q_func_vars = U.scope_vars(U.absolute_scope_name("target_q_func"))
 
-        # global weights
-        q_global = q_func(obs_t_input.get(), num_actions, scope="global_weights", reuse=(not chief))
-        global_q_func_vars = U.scope_vars(U.absolute_scope_name("global_weights"))
+            # global weights
+            print("chief:", chief, "reuse:", True if not chief else None)
+            global_q_func_vars = []
+            # with tf.device(tf.train.replica_device_setter(cluster=cluster)):
+            with tf.device("/job:ps/task:0"):
+                # q_global = q_func(obs_t_input.get(), num_actions, scope="global_weights", reuse=None if chief else True)#reuse=(not chief))
+                # q_global = q_func(obs_t_input.get(), num_actions, scope="global_weights")
+                with tf.variable_scope("global_weights"):
+                    for var in q_func_vars:
+                        name = var.name.split(":")[0].split("q_func/")[-1]
+                        global_q_func_vars.append(
+                            tf.get_variable(name=name, shape=var.shape, dtype=var.dtype,
+                                            initializer=tf.contrib.layers.xavier_initializer(seed=1, dtype=var.dtype)))
+            # global_q_func_vars = U.scope_vars(U.absolute_scope_name("global_weights"))
+            print("Global:", global_q_func_vars)
 
-        # old weights (used to implicitly calculate gradient sum: q_func_vars - q_func_vars_old)
-        q_old = q_func(obs_t_input.get(), num_actions, scope="old_weights")
-        q_func_vars_old = U.scope_vars(U.absolute_scope_name("old_weights"))
+            # old weights (used to implicitly calculate gradient sum: q_func_vars - q_func_vars_old)
+            q_func_vars_old = []
+            with tf.variable_scope("old_weights"):
+                for var in q_func_vars:
+                    name = var.name.split(":")[0].split("q_func/")[-1]
+                    q_func_vars_old.append(
+                        tf.get_variable(name=name, shape=var.shape, dtype=var.dtype,
+                                        initializer=tf.contrib.layers.xavier_initializer(seed=1, dtype=var.dtype)))
+            # q_old = q_func(obs_t_input.get(), num_actions, scope="old_weights")
+            # q_func_vars_old = U.scope_vars(U.absolute_scope_name("old_weights"))
+            print("Old vars:", q_func_vars_old)
 
-        # q scores for actions which we know were selected in the given state.
-        q_t_selected = tf.reduce_sum(q_t * tf.one_hot(act_t_ph, num_actions), 1)
+            # q scores for actions which we know were selected in the given state.
+            q_t_selected = tf.reduce_sum(q_t * tf.one_hot(act_t_ph, num_actions), 1)
 
-        # compute estimate of best possible value starting from state at t + 1
-        if double_q:
-            q_tp1_using_online_net = q_func(obs_tp1_input.get(), num_actions, scope="q_func", reuse=True)
-            q_tp1_best_using_online_net = tf.arg_max(q_tp1_using_online_net, 1)
-            q_tp1_best = tf.reduce_sum(q_tp1 * tf.one_hot(q_tp1_best_using_online_net, num_actions), 1)
-        else:
-            q_tp1_best = tf.reduce_max(q_tp1, 1)
-        q_tp1_best_masked = (1.0 - done_mask_ph) * q_tp1_best
+            # compute estimate of best possible value starting from state at t + 1
+            if double_q:
+                q_tp1_using_online_net = q_func(obs_tp1_input.get(), num_actions, scope="q_func", reuse=True)
+                q_tp1_best_using_online_net = tf.arg_max(q_tp1_using_online_net, 1)
+                q_tp1_best = tf.reduce_sum(q_tp1 * tf.one_hot(q_tp1_best_using_online_net, num_actions), 1)
+            else:
+                q_tp1_best = tf.reduce_max(q_tp1, 1)
+            q_tp1_best_masked = (1.0 - done_mask_ph) * q_tp1_best
 
-        # compute RHS of bellman equation
-        q_t_selected_target = rew_t_ph + gamma * q_tp1_best_masked
+            # compute RHS of bellman equation
+            q_t_selected_target = rew_t_ph + gamma * q_tp1_best_masked
 
-        # compute the error (potentially clipped)
-        td_error = q_t_selected - tf.stop_gradient(q_t_selected_target)
-        errors = U.huber_loss(td_error)
-        weighted_error = tf.reduce_mean(importance_weights_ph * errors)
+            # compute the error (potentially clipped)
+            td_error = q_t_selected - tf.stop_gradient(q_t_selected_target)
+            errors = U.huber_loss(td_error)
+            weighted_error = tf.reduce_mean(importance_weights_ph * errors)
 
-        # compute optimization op (potentially with gradient clipping)
-        if grad_norm_clipping is not None:
-            optimize_expr = U.minimize_and_clip(optimizer,
-                                                weighted_error,
-                                                var_list=q_func_vars,
-                                                clip_val=grad_norm_clipping)
-        else:
-            optimize_expr = optimizer.minimize(weighted_error, var_list=q_func_vars)
+            # compute optimization op (potentially with gradient clipping)
+            if grad_norm_clipping is not None:
+                optimize_expr = U.minimize_and_clip(optimizer,
+                                                    weighted_error,
+                                                    var_list=q_func_vars,
+                                                    clip_val=grad_norm_clipping)
+            else:
+                optimize_expr = optimizer.minimize(weighted_error, var_list=q_func_vars)
 
-        # --------------- Optimizer code for gradient summation ---------------
-        # Calculate the gradient wrt. the LOCAL q weights
-        # gradient = optimizer.compute_gradients(weighted_error, var_list=q_func_vars)
-        # Opt for applying the gradient directly (used locally on the local weights)
-        # optimize_expr = optimizer.apply_gradients(gradient)
+            # --------------- Optimizer code for gradient summation ---------------
+            # Calculate the gradient wrt. the LOCAL q weights
+            # gradient = optimizer.compute_gradients(weighted_error, var_list=q_func_vars)
+            # Opt for applying the gradient directly (used locally on the local weights)
+            # optimize_expr = optimizer.apply_gradients(gradient)
 
-        # Loop through the gradient and create placeholders of the same size
-        # shapes = [g[0].get_shape() for g in gradient]
-        # gradient_ph = U.GradientInput(shapes)
+            # Loop through the gradient and create placeholders of the same size
+            # shapes = [g[0].get_shape() for g in gradient]
+            # gradient_ph = U.GradientInput(shapes)
 
-        # Create (placeholder, global weight) pairs for every layer of the gradient
-        # Placeholder will be fed the value of the AVERAGED gradient, resulting in a final gradient on the form:
-        # [(averaged_weights, global_weights)]
-        # gg = list(zip(gradient_ph.get(), global_q_func_vars))
-        # Do averaging of the gradients here? requires t_global_old, t_global_new, and dt (local steps this run)
+            # Create (placeholder, global weight) pairs for every layer of the gradient
+            # Placeholder will be fed the value of the AVERAGED gradient, resulting in a final gradient on the form:
+            # [(averaged_weights, global_weights)]
+            # gg = list(zip(gradient_ph.get(), global_q_func_vars))
+            # Do averaging of the gradients here? requires t_global_old, t_global_new, and dt (local steps this run)
 
-        # Create opt which applies the new gradient to the GLOBAL weights
-        # optimize_global_expr2 = optimizer.apply_gradients(gg)
-        # --------------- End of gradient summation ---------------
+            # Create opt which applies the new gradient to the GLOBAL weights
+            # optimize_global_expr2 = optimizer.apply_gradients(gg)
+            # --------------- End of gradient summation ---------------
 
-        # update_target_fn will be called periodically to copy Q network to target Q network
-        update_target_expr = []
-        for var, var_target in zip(sorted(q_func_vars, key=lambda v: v.name),
-                                   sorted(target_q_func_vars, key=lambda v: v.name)):
-            update_target_expr.append(var_target.assign(var))
-        update_target_expr = tf.group(*update_target_expr)
+            # update_target_fn will be called periodically to copy Q network to target Q network
+            update_target_expr = []
+            for var, var_target in zip(sorted(q_func_vars, key=lambda v: v.name),
+                                       sorted(target_q_func_vars, key=lambda v: v.name)):
+                update_target_expr.append(var_target.assign(var))
+            update_target_expr = tf.group(*update_target_expr)
 
-        # update_global_fn will be called periodically to copy global Q network to q network
-        update_global_expr = []
-        for var_global, var, var_old in zip(sorted(global_q_func_vars, key=lambda v: v.name),
-                                            sorted(q_func_vars, key=lambda v: v.name),
-                                            sorted(q_func_vars_old, key=lambda v: v.name)):
-            update_global_expr.append(var.assign(var_global))
-            # TODO Can async cause var <- var_global, var_global <- new value, var_old <- var_global in that order?
-            # TODO Should this copy from var instead? (concurrency issues?)
-            # TODO Can concurrency cause var_old <- var, var <- var_global in that order (resulting in wrong values)?
-            # TODO Safest method is to force sequential execution of var <- var_global, var_old <- var! How though?
-            update_global_expr.append(var_old.assign(var_global))
-        update_global_expr = tf.group(*update_global_expr)
+            # update_global_fn will be called periodically to copy global Q network to q network
+            update_global_expr = []
+            for var_global, var, var_old in zip(sorted(global_q_func_vars, key=lambda v: v.name),
+                                                sorted(q_func_vars, key=lambda v: v.name),
+                                                sorted(q_func_vars_old, key=lambda v: v.name)):
+                update_global_expr.append(var.assign(var_global))
+                # TODO Can async cause var <- var_global, var_global <- new value, var_old <- var_global in that order?
+                # TODO Should this copy from var instead? (concurrency issues?)
+                # TODO Can concurrency cause var_old <- var, var <- var_global in that order (resulting in wrong values)?
+                # TODO Safest method is to force sequential execution of var <- var_global, var_old <- var! How though?
+                update_global_expr.append(var_old.assign(var_global))
+            update_global_expr = tf.group(*update_global_expr)
 
-        # update the global time step counter by adding the local
-        update_t_global = t_global.assign_add(t)
+            # update the global time step counter by adding the local
+            update_t_global = t_global.assign_add(t)
 
-        optimize_global_expr = []
-        # Factor to multiply every gradient with
-        # f = t / (t_global - t_global_old)
-        factor = tf.div(t, tf.subtract(update_t_global, t_global_old))
-        for var, var_old, var_global in zip(sorted(q_func_vars, key=lambda v: v.name),
-                                            sorted(q_func_vars_old, key=lambda v: v.name),
-                                            sorted(global_q_func_vars, key=lambda v: v.name)):
-            # Multiply the difference between the old parameters and the locally optimized parameters
-            # g = (var - var_old) * f
-            grad = tf.multiply(tf.subtract(var, var_old), factor)
-            optimize_global_expr.append(var_global.assign_add(grad))
-        optimize_global_expr = tf.group(*optimize_global_expr)
+            optimize_global_expr = []
+            # Factor to multiply every gradient with
+            # f = t / (t_global - t_global_old)
+            factor = tf.div(t, tf.subtract(update_t_global, t_global_old))
+            for var, var_old, var_global in zip(sorted(q_func_vars, key=lambda v: v.name),
+                                                sorted(q_func_vars_old, key=lambda v: v.name),
+                                                sorted(global_q_func_vars, key=lambda v: v.name)):
+                # Multiply the difference between the old parameters and the locally optimized parameters
+                # g = (var - var_old) * f
+                grad = tf.multiply(tf.subtract(var, var_old), factor)
+                optimize_global_expr.append(var_global.assign_add(grad))
+            optimize_global_expr = tf.group(*optimize_global_expr)
 
-        # Create callable functions
-        train = U.function(
-            inputs=[
-                obs_t_input,
-                act_t_ph,
-                rew_t_ph,
-                obs_tp1_input,
-                done_mask_ph,
-                importance_weights_ph
-            ],
-            outputs=[td_error],
-            # outputs=[td_error, gradient],
-            updates=[optimize_expr]
-        )
-        # global_opt2 = U.function(inputs=[gradient_ph], outputs=[], updates=[optimize_global_expr2])
-        global_opt = U.function(inputs=[t, t_global_old], outputs=[], updates=[optimize_global_expr])
-        update_weights = U.function(inputs=[], outputs=[t_global], updates=[update_global_expr])
-        update_target = U.function([], [], updates=[update_target_expr])
+            # Create callable functions
+            train = U.function(
+                inputs=[
+                    obs_t_input,
+                    act_t_ph,
+                    rew_t_ph,
+                    obs_tp1_input,
+                    done_mask_ph,
+                    importance_weights_ph
+                ],
+                outputs=[td_error],
+                # outputs=[td_error, gradient],
+                updates=[optimize_expr]
+            )
+            # global_opt2 = U.function(inputs=[gradient_ph], outputs=[], updates=[optimize_global_expr2])
+            global_opt = U.function(inputs=[t, t_global_old], outputs=[factor], updates=[optimize_global_expr])
+            update_weights = U.function(inputs=[], outputs=[t_global], updates=[update_global_expr])
+            update_target = U.function([], [], updates=[update_target_expr])
 
-        # Debugging functions
-        q_values = U.function([obs_t_input], q_t)
-        weights = U.function(inputs=[], outputs=[q_func_vars, global_q_func_vars, q_func_vars_old], updates=[])
-        t_global_func = U.function([], t_global)
+            # Debugging functions
+            q_values = U.function([obs_t_input], q_t)
+            weights = U.function(inputs=[], outputs=[q_func_vars, global_q_func_vars, q_func_vars_old], updates=[])
+            t_global_func = U.function([], t_global)
 
-        return act_f, train, global_opt, update_target, update_weights, \
-               {'q_values': q_values, 'weights': weights, 't_global': t_global_func}
+            return act_f, train, global_opt, update_target, update_weights, \
+                   {'q_values': q_values, 'weights': weights, 't_global': t_global_func}

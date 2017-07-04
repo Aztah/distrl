@@ -242,12 +242,13 @@ def get_session():
     return tf.get_default_session()
 
 
-def make_session(num_cpu):
+def make_session(num_cpu=4, target=''):
     """Returns a session that will use <num_cpu> CPU's only"""
     tf_config = tf.ConfigProto(
+        # log_device_placement=True,  # TODO Remove because SO MUCH SPAM
         inter_op_parallelism_threads=num_cpu,
         intra_op_parallelism_threads=num_cpu)
-    return tf.Session(config=tf_config)
+    return tf.Session(target=target, config=tf_config)
 
 
 def single_threaded_session():
@@ -258,9 +259,15 @@ def single_threaded_session():
 ALREADY_INITIALIZED = set()
 
 
-def initialize():
+def initialize(chief=True):
     """Initialize all the uninitialized variables in the global scope."""
     new_variables = set(tf.global_variables()) - ALREADY_INITIALIZED
+    if not chief:
+        new_variables = set(filter(lambda x: "global" not in x.name, new_variables))
+    print("Initializing", len(new_variables), "vars:")
+    names = [x.name + "  -  " + x.device for x in new_variables]
+    print(*sorted(names), sep='\n')
+    print("Vars done")
     get_session().run(tf.variables_initializer(new_variables))
     ALREADY_INITIALIZED.update(new_variables)
 
