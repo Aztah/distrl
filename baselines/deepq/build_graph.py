@@ -214,7 +214,7 @@ def build_train(make_obs_ph, q_func, num_actions, optimizer, chief=False, server
             print("chief:", chief, "reuse:", True if not chief else None)
             global_q_func_vars = []
             # with tf.device(tf.train.replica_device_setter(cluster=cluster)):
-            with tf.device("/job:ps/task:0"):
+            with tf.device("/job:ps/task:0"):  # TODO needs RDS if using multiple PS
                 # q_global = q_func(obs_t_input.get(), num_actions, scope="global_weights", reuse=None if chief else True)#reuse=(not chief))
                 # q_global = q_func(obs_t_input.get(), num_actions, scope="global_weights")
                 with tf.variable_scope("global_weights"):
@@ -266,26 +266,6 @@ def build_train(make_obs_ph, q_func, num_actions, optimizer, chief=False, server
                                                     clip_val=grad_norm_clipping)
             else:
                 optimize_expr = optimizer.minimize(weighted_error, var_list=q_func_vars)
-
-            # --------------- Optimizer code for gradient summation ---------------
-            # Calculate the gradient wrt. the LOCAL q weights
-            # gradient = optimizer.compute_gradients(weighted_error, var_list=q_func_vars)
-            # Opt for applying the gradient directly (used locally on the local weights)
-            # optimize_expr = optimizer.apply_gradients(gradient)
-
-            # Loop through the gradient and create placeholders of the same size
-            # shapes = [g[0].get_shape() for g in gradient]
-            # gradient_ph = U.GradientInput(shapes)
-
-            # Create (placeholder, global weight) pairs for every layer of the gradient
-            # Placeholder will be fed the value of the AVERAGED gradient, resulting in a final gradient on the form:
-            # [(averaged_weights, global_weights)]
-            # gg = list(zip(gradient_ph.get(), global_q_func_vars))
-            # Do averaging of the gradients here? requires t_global_old, t_global_new, and dt (local steps this run)
-
-            # Create opt which applies the new gradient to the GLOBAL weights
-            # optimize_global_expr2 = optimizer.apply_gradients(gg)
-            # --------------- End of gradient summation ---------------
 
             # update_target_fn will be called periodically to copy Q network to target Q network
             update_target_expr = []
@@ -348,4 +328,5 @@ def build_train(make_obs_ph, q_func, num_actions, optimizer, chief=False, server
             t_global_func = U.function([], t_global)
 
             return act_f, train, global_opt, update_target, update_weights, \
-                   {'q_values': q_values, 'weights': weights, 't_global': t_global_func}
+                {'q_values': q_values, 'weights': weights, 't_global': t_global_func}
+

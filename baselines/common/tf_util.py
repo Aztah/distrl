@@ -149,28 +149,6 @@ class BatchInput(PlacholderTfInput):
         super().__init__(tf.placeholder(dtype, [None] + list(shape), name=name))
 
 
-# TODO This is for inputting gradients to the model (remove?)
-class GradientInput(TfInput):
-    def __init__(self, shapes, dtype=tf.float32, name="gradient"):
-        super().__init__(name=name)
-
-        self.ph_list = []
-        i = 0
-        for shape in shapes:
-            self.ph_list.append(tf.placeholder(dtype=dtype, shape=shape, name=self.name+"_"+str(i)))
-            i += 1
-
-    def get(self):
-        return self.ph_list
-
-    def make_feed_dict(self, data):
-        feed_dict = {}
-        for ph, gs in zip(self.ph_list, data):
-            feed_dict[ph] = gs
-
-        return feed_dict
-
-
 class Uint8Input(PlacholderTfInput):
     def __init__(self, shape, name=None):
         """Takes input in uint8 format which is cast to float32 and divided by 255
@@ -245,7 +223,6 @@ def get_session():
 def make_session(num_cpu=4, target=''):
     """Returns a session that will use <num_cpu> CPU's only"""
     tf_config = tf.ConfigProto(
-        # log_device_placement=True,  # TODO Remove because SO MUCH SPAM
         inter_op_parallelism_threads=num_cpu,
         intra_op_parallelism_threads=num_cpu)
     return tf.Session(target=target, config=tf_config)
