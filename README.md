@@ -21,23 +21,11 @@ Implement a distributed DQN algorithm according to [this specification](https://
 ## How to run ##
 
     cd baselines/deepq/experiments/
-    python async_fed_avg.py [--ps_hosts "localhost:13337"]
-                            [--worker_hosts "localhost:13338,localhost:13339"]
-                            --job_name "worker"
-                            --task_index 0
-                            [--learning_rate 5e-4]
-                            [--batch_size 32]
-                            [--memory_size 50000]
-                            [--target_update 1000]
+    python async_fed_avg.py [--config_file config.ini]
+                            [--config DEFAULT]
+                             --job_name "worker"
+                             --task_index 0
                             [--seed 1]
-                            [--comm_rounds 500000]
-                            [--epochs 100]
-
-or
-
-    python async_fed_avg.py --config <config_file_name>
-                            --job_name "worker"
-                            --task_index 0
 
 ## Files to edit ##
 The asynchronous Cart Pole script is located at

@@ -38,16 +38,32 @@ env_name = "CartPole-v0"
 max_reward = 200
 
 
-def write_csv(file_name, episode, reward, avg_reward, t_global, factor, chief):
+def write_csv(file_name, episode, reward, avg_reward, t_global, dt, chief):
     if chief:
         try:
             with open(file_name + ".csv", 'a', newline='') as csv_file:
                 csv_writer = csv.writer(csv_file, delimiter=';')
                 if episode == 1:
-                    csv_writer.writerow(["episode", "reward", "avg_reward", "t_global", "factor"])
-                csv_writer.writerow([episode, reward, avg_reward, t_global, factor])
+                    csv_writer.writerow(["episode", "reward", "avg_reward", "t_global", "dt"])
+                csv_writer.writerow([episode, reward, avg_reward, t_global, dt])
         except PermissionError:
-            print("Permission error. CSV write failed: [", episode, reward, avg_reward, t_global, factor, "]")
+            print("Permission error. CSV write failed: [", episode, reward, avg_reward, t_global, dt, "]")
+
+
+def write_csv_final(file_name, final_episode, round_log):
+    new_filename = file_name + "=" + str(final_episode) + "ep.csv"
+    with open(file_name + ".csv", 'r') as infile, open(new_filename, 'w', newline='') as outfile:
+        reader = csv.reader(infile)
+        writer = csv.writer(outfile, delimiter=';')
+        i = 0
+        for row in reader:
+            writer.writerow(row[0].split(";") + ([] if i >= len(round_log) else round_log[i]))
+            i += 1
+
+        for a in round_log[i:]:
+            writer.writerow([None, None, None, None, None] + a)
+    os.remove(file_name + ".csv")
+    print("Results saved in:  ", new_filename, sep='')
 
 
 def model(inpt, num_actions, scope, reuse=False):
@@ -66,23 +82,31 @@ def main(_):
     config = configparser.ConfigParser()
     config.read(FLAGS.config_file)
 
-    ps_hosts = FLAGS.ps_hosts if FLAGS.ps_hosts else config.get(FLAGS.config, 'ps_hosts').split(",")
-    worker_hosts = FLAGS.worker_hosts if FLAGS.worker_hosts else config.get(FLAGS.config, 'worker_hosts').split(",")
+    ps_hosts = config.get(FLAGS.config, 'ps_hosts').split(",")
+    worker_hosts = config.get(FLAGS.config, 'worker_hosts').split(",")
     job = FLAGS.job_name
     task = FLAGS.task_index
-    learning_rate = FLAGS.learning_rate if FLAGS.learning_rate else config.getfloat(FLAGS.config, 'learning_rate')
-    batch_size = FLAGS.batch_size if FLAGS.batch_size else config.getint(FLAGS.config, 'batch_size')
-    memory_size = FLAGS.memory_size if FLAGS.memory_size else config.getint(FLAGS.config, 'memory_size')
-    target_update = FLAGS.target_update if FLAGS.target_update else config.getint(FLAGS.config, 'target_update')
+    learning_rate = config.getfloat(FLAGS.config, 'learning_rate')
+    batch_size = config.getint(FLAGS.config, 'batch_size')
+    memory_size = config.getint(FLAGS.config, 'memory_size')
+    target_update = config.getint(FLAGS.config, 'target_update')
     seed = FLAGS.seed if FLAGS.seed else config.getint(FLAGS.config, 'seed')
-    comm_rounds = FLAGS.comm_rounds if FLAGS.comm_rounds else config.getint(FLAGS.config, 'comm_rounds')
-    epochs = FLAGS.epochs if FLAGS.epochs else config.getint(FLAGS.config, 'epochs')
-    backup = FLAGS.backup if FLAGS.backup else config.getint(FLAGS.config, 'backup')  # unused in async
+    max_comm_rounds = config.getint(FLAGS.config, 'comm_rounds')
+    epochs = config.getint(FLAGS.config, 'start_epoch')
+    end_epoch = config.getint(FLAGS.config, 'end_epoch')
+    epoch_decay = config.getint(FLAGS.config, 'epoch_decay')
+    # epoch_decay_rate = (epochs - end_epoch) / epoch_decay
+    epoch = LinearSchedule(epoch_decay, end_epoch, epochs)
+    end_alpha = config.getfloat(FLAGS.config, 'end_alpha')
+    alpha_decay = config.getint(FLAGS.config, 'alpha_decay')
+    alpha = LinearSchedule(alpha_decay, end_alpha)
+    backup = config.getint(FLAGS.config, 'backup')  # unused in async
 
-    print("Config: (ps_hosts={}, worker_hosts={}, job_name={}, task_index={}, learning_rate={}, batch_size={}, "
-          "memory_size={}, target_update={}, seed={}, comm_rounds={}, epochs={}, backup={})"
-          .format(ps_hosts, worker_hosts, job, task, learning_rate, batch_size,
-                  memory_size, target_update, seed, comm_rounds, epochs, backup))
+    print("Config:\nps_hosts={}\nworker_hosts={}\njob_name={}\ntask_index={}\nlearning_rate={}\n"
+          "batch_size={}\nmemory_size={}\ntarget_update={}\nseed={}\ncomm_rounds={}\nepochs={}\n"
+          "end_epoch={}\nepoch_decay={}\nend_alpha={}\nalpha_decay={}backup={}"
+          .format(ps_hosts, worker_hosts, job, task, learning_rate, batch_size, memory_size, target_update,
+                  seed, max_comm_rounds, epochs, end_epoch, epoch_decay, end_alpha, alpha_decay, backup))
 
     cluster = tf.train.ClusterSpec({'ps': ps_hosts, 'worker': worker_hosts})
     chief = True if job == 'worker' and task == 0 else False
@@ -94,9 +118,10 @@ def main(_):
     # Set a unique random seed for each client
     seed += task
     random.seed(seed)
-    run_code = datetime.now().strftime("%y%m%d-%H%M%S")
-    run_code += "-" + env_name + "-p" + str(len(ps_hosts)) + "w" + str(len(worker_hosts)) + "-E" + str(epochs) + \
-                "-b" + str(batch_size) + "-m" + str(memory_size) + "-N" + str(target_update)
+
+    run_code = "{}-{}-p{}w{}-E{}-b{}-m{}-N{}-lr{}-B{}".\
+        format(datetime.now().strftime("%y%m%d-%H%M%S"), env_name, len(ps_hosts), len(worker_hosts),
+               epochs, batch_size, memory_size, target_update, learning_rate, backup)
 
     print("Run code:", run_code)
 
@@ -117,6 +142,7 @@ def main(_):
             q_func=model,
             num_actions=env.action_space.n,
             optimizer=tf.train.AdamOptimizer(learning_rate=learning_rate),
+            # optimizer=tf.train.GradientDescentOptimizer(learning_rate=learning_rate),
             chief=chief,
             server=server,
         )
@@ -138,8 +164,11 @@ def main(_):
 
         t_global_old = update_weights()[0][0]
         update_target()
-        t_start = 0
-        factor = [[1]]
+        exp_gen = 1000  # For how many timesteps sould we only generate experience (not train)
+        t_start = exp_gen
+        comm_rounds = 0
+        dt = [[0]]
+        round_log = [[None, "comm_rounds", "t", "staleness", "epoch"]]
 
         episode_rewards = [0.0]
         obs = env.reset()
@@ -155,43 +184,47 @@ def main(_):
             if done:
                 # if len(episode_rewards) % 10 == 0:
                 #     env.render()
-
-                # Append results to CSV file
-                if len(episode_rewards) < 1:
-                    avg_rew = 0
-                else:
-                    avg_rew = np.round(np.mean(np.array(episode_rewards[-100:])), 1)
+                avg_rew = np.round(np.mean(np.array(episode_rewards[-100:])), 1)
                 write_csv(run_code, len(episode_rewards), episode_rewards[-1], avg_rew, debug['t_global']()[0],
-                          factor[0][0], chief)
+                          dt[0][0], chief)
 
                 # Reset and prepare for next episode
                 obs = env.reset()
                 episode_rewards.append(0)
 
             is_solved = t > 100 and np.mean(episode_rewards[-101:-1]) >= max_reward
-            if is_solved or t >= comm_rounds * epochs:  # TODO should be t_global, not t
+            if is_solved or comm_rounds >= max_comm_rounds:
                 if chief:
-                    print("Results saved in: ", run_code, ".csv", sep='')
+                    write_csv_final(run_code, str(len(episode_rewards)), round_log)
                 print("Converged after:  ", len(episode_rewards), "episodes")
                 print("Agent total steps:", t)
                 print("Global steps:     ", debug['t_global']()[0])
                 return
             else:
                 # Minimize the error in Bellman's equation on a batch sampled from replay buffer.
-                if t >= 1000:
+                if t >= exp_gen:
+                # if t >= batch_size:
                     obses_t, actions, rewards, obses_tp1, dones = replay_buffer.sample(batch_size)
                     td_error = train(obses_t, actions, rewards, obses_tp1, dones, np.ones_like(rewards))
 
-                    if t - t_start >= epochs:  # The number of local timesteps to calculate before averaging gradients
+                    if t - t_start >= np.round(epoch.value(comm_rounds)):  # The number of local timesteps to calculate before averaging gradients
                         # print("t = {}, Updating global network (t_global = {})".format(t, debug['t_global']()[0]))
 
                         # Apply gradients to weights in PS
-                        factor = global_opt([t - t_start], [t_global_old])
+                        dt = global_opt([t - t_start], [t_global_old], [alpha.value(comm_rounds)])
 
                         # Update the local weights with the new global weights from PS
                         t_global_old = update_weights()[0][0]
 
+                        comm_rounds += 1
+                        round_log.append([None])
+                        round_log[-1].append(comm_rounds)
+                        round_log[-1].append(t)
+                        round_log[-1].append(dt[0][0])
+                        round_log[-1].append(epoch.value(comm_rounds))
+
                         t_start = t
+                        # epochs = end_epoch if epochs <= end_epoch else epochs - epoch_decay_rate
 
                 # Update target network periodically.
                 if t % target_update == 0:
@@ -201,7 +234,7 @@ def main(_):
                 last_rewards = episode_rewards[-101:-1]
                 logger.record_tabular("steps", t)
                 logger.record_tabular("global steps", debug['t_global']()[0])
-                logger.record_tabular("communication rounds", debug['t_global']()[0] / epochs)
+                logger.record_tabular("communication rounds", comm_rounds)
                 logger.record_tabular("episodes", len(episode_rewards))
                 logger.record_tabular("mean episode reward", np.round(np.mean(episode_rewards[-101:-1]), 4))
                 logger.record_tabular("% time spent exploring", int(100 * exploration.value(t)))
@@ -219,24 +252,13 @@ if __name__ == "__main__":
         "--config_file",
         type=str,
         default="config.ini",
-        help="Filename of config file. Overrides all arguments except 'job_name' and 'task_index'"
+        help="Filename of config file"
     )
     parser.add_argument(
         "--config",
         type=str,
-        default="async",
+        default="DEFAULT",
         help="Name of the section in the config file to read "
-    )
-    # Flags for defining the tf.train.ClusterSpec
-    parser.add_argument(
-        "--ps_hosts",
-        type=str,
-        help="Comma-separated list of hostname:port pairs"
-    )
-    parser.add_argument(
-        "--worker_hosts",
-        type=str,
-        help="Comma-separated list of hostname:port pairs"
     )
     # Flags for defining the tf.train.Server
     parser.add_argument(
@@ -251,47 +273,11 @@ if __name__ == "__main__":
         default=0,
         help="Index of task within the job"
     )
-    # Flags for the Q-learning hyperparameters
-    parser.add_argument(
-        "--learning_rate",
-        type=float,
-        help="Learning rate for Adam optimizer"
-    )
-    parser.add_argument(
-        "--batch_size",
-        type=int,
-        help="Size of the sample used for the mini-batch fed to every learning step"
-    )
-    parser.add_argument(
-        "--memory_size",
-        type=int,
-        help="Max size of the experience replay memory"
-    )
-    parser.add_argument(
-        "--target_update",
-        type=int,
-        help="Local timesteps between updates to the target Q-network"
-    )
     # Flags for FedAvg algorithm hyperparameters
     parser.add_argument(
         "--seed",
         type=int,
         help="Seed for randomness (reproducibility)"
-    )
-    parser.add_argument(
-        "--comm_rounds",
-        type=int,
-        help="Total number of communication rounds to execute before interrupting"
-    )
-    parser.add_argument(
-        "--epochs",
-        type=int,
-        help="Number of epochs to run every communication round"
-    )
-    parser.add_argument(
-        "--backup",
-        type=int,
-        help="Number of backup workers to use (implicitly sets n = total - b)"
     )
     FLAGS, unparsed = parser.parse_known_args()
     print("Unparsed:", unparsed)

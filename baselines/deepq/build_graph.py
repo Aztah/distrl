@@ -196,6 +196,7 @@ def build_train(make_obs_ph, q_func, num_actions, optimizer, chief=False, server
             # Local timestep counters
             t = tf.placeholder(tf.float32, [1], name="t")
             t_global_old = tf.placeholder(tf.float32, [1], name="t_global_old")
+            alpha = tf.placeholder(tf.float32, [1], name="alpha")
 
             # Global timestep counter
             # TODO Does TF have built-in global step counters?
@@ -293,7 +294,8 @@ def build_train(make_obs_ph, q_func, num_actions, optimizer, chief=False, server
             optimize_global_expr = []
             # Factor to multiply every gradient with
             # f = t / (t_global - t_global_old)
-            factor = tf.div(t, tf.subtract(update_t_global, t_global_old))
+            dt = tf.subtract(update_t_global, t_global_old)
+            factor = tf.multiply(alpha, tf.div(t, dt))
             for var, var_old, var_global in zip(sorted(q_func_vars, key=lambda v: v.name),
                                                 sorted(q_func_vars_old, key=lambda v: v.name),
                                                 sorted(global_q_func_vars, key=lambda v: v.name)):
@@ -318,7 +320,7 @@ def build_train(make_obs_ph, q_func, num_actions, optimizer, chief=False, server
                 updates=[optimize_expr]
             )
             # global_opt2 = U.function(inputs=[gradient_ph], outputs=[], updates=[optimize_global_expr2])
-            global_opt = U.function(inputs=[t, t_global_old], outputs=[factor], updates=[optimize_global_expr])
+            global_opt = U.function(inputs=[t, t_global_old, alpha], outputs=[dt], updates=[optimize_global_expr])
             update_weights = U.function(inputs=[], outputs=[t_global], updates=[update_global_expr])
             update_target = U.function([], [], updates=[update_target_expr])
 
