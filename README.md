@@ -27,6 +27,21 @@ Implement a distributed DQN algorithm according to [this specification](https://
                              --task_index 0
                             [--seed 1]
 
+* `config_file` is the name of the config file (or path if it's in a different directory).
+    * Defaults to `config.ini`
+    
+* `config` is the section in the config file to override the default values with.
+    * Defaults to `DEFAULT`. Use `async` for the `[async]` section and `sync` for the `[sync]`
+
+* `job_name` is the type of job the current client should perform.
+    * Defaults to `worker`. Use only `worker` or `ps` for this value
+
+* `task_index` is the index of the current server's IP in the list for its job (ps or worker).
+    * Defaults to `0`. Worker 0 will become the chief with extra responsibilities
+
+* `seed` is the seed for all the randomness in the server.
+    * Defaults to `1`. The server's task index will be added to this to make sure every server has a unique seed
+
 ## Files to edit ##
 The asynchronous Cart Pole script is located at
 
