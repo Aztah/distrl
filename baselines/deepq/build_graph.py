@@ -127,8 +127,8 @@ def build_act(make_obs_ph, q_func, num_actions, scope="deepq", reuse=None, task=
             return act
 
 
-def build_train(make_obs_ph, q_func, num_actions, optimizer, chief=False, server=None, grad_norm_clipping=None,
-                gamma=1.0, double_q=True, scope="deepq", reuse=None):
+def build_train(make_obs_ph, q_func, num_actions, optimizer, chief=False, server=None, workers=1,
+                grad_norm_clipping=None, gamma=1.0, double_q=True, scope="deepq", reuse=None):
     """Creates the act function:
 
     Parameters
@@ -196,12 +196,19 @@ def build_train(make_obs_ph, q_func, num_actions, optimizer, chief=False, server
             # Local timestep counters
             t = tf.placeholder(tf.float32, [1], name="t")
             t_global_old = tf.placeholder(tf.float32, [1], name="t_global_old")
+            comm_rounds = tf.placeholder(tf.float32, [1], name="comm_rounds")
             alpha = tf.placeholder(tf.float32, [1], name="alpha")
+            score_input = tf.placeholder(tf.float32, [1], name="score_input")
 
             # Global timestep counter
             # TODO Does TF have built-in global step counters?
             with tf.device("/job:ps/task:0"):
                 t_global = tf.Variable(dtype=tf.float32, initial_value=[0], name="t_global")
+                run_code_global = tf.Variable(initial_value="", name="run_code_global")
+                comm_rounds_global = tf.Variable(dtype=tf.float32, initial_value=[0], name="comm_rounds_global")
+                max_workers_global = tf.constant(workers, dtype=tf.float32, name="max_workers_global")
+                worker_count_global = tf.Variable(dtype=tf.float32, initial_value=[0], name="worker_count_global")
+                score_global = tf.Variable(dtype=tf.float32, initial_value=[0], name="score_global")
 
             # q network evaluation
             q_t = q_func(obs_t_input.get(), num_actions, scope="q_func", reuse=True)  # reuse parameters from act
@@ -305,6 +312,36 @@ def build_train(make_obs_ph, q_func, num_actions, optimizer, chief=False, server
                 optimize_global_expr.append(var_global.assign_add(grad))
             optimize_global_expr = tf.group(*optimize_global_expr)
 
+            # if cr == cr_g and wc < wc_max:
+            #   wc += 1
+            #   score_global += score
+            # return cr
+            submit_score_expr = 0
+            #     tf.cond(tf.logical_and(tf.equal(comm_rounds, comm_rounds_global),
+            #                            tf.less(worker_count_global, max_workers_global)),
+            #             tf.group(worker_count_global.assign_add(1),
+            #                      score_global.assign_add(score_input)))
+
+            optimize_global_sync_expr = []
+            # sync_factor = 1
+            # if worker_count_global < 5:  # TODO should be less than the limit
+            #     # Add gradient to queue
+            #     # increment worker count global
+            #     # return current comm rounds
+            #     print("bajs")
+            # if worker_count_global == 5:
+            #     # Add gradient to queue
+            #     # Process the queue (multiply each gradient with constant fraction or reward fraction)
+            #     # Add processed gradient to global parameters
+            #     # reset worker count
+            #     # increment comm rounds
+            #     # return comm rounds
+            #     print("korv")
+            # else:
+            #     # Return comm rounds only
+            #     print("moj")
+            optimize_global_sync_expr = tf.group(*optimize_global_sync_expr)
+
             # Create callable functions
             train = U.function(
                 inputs=[
@@ -316,19 +353,23 @@ def build_train(make_obs_ph, q_func, num_actions, optimizer, chief=False, server
                     importance_weights_ph
                 ],
                 outputs=[td_error],
-                # outputs=[td_error, gradient],
                 updates=[optimize_expr]
             )
-            # global_opt2 = U.function(inputs=[gradient_ph], outputs=[], updates=[optimize_global_expr2])
-            global_opt = U.function(inputs=[t, t_global_old, alpha], outputs=[dt], updates=[optimize_global_expr])
+            global_opt = U.function(inputs=[t, t_global_old, comm_rounds, alpha], outputs=[dt, comm_rounds_global], updates=[optimize_global_expr])
+            # global_sync_opt = U.function(inputs=[comm_rounds], outputs=[comm_rounds_global], updates=[optimize_global_sync_expr])
             update_weights = U.function(inputs=[], outputs=[t_global], updates=[update_global_expr])
             update_target = U.function([], [], updates=[update_target_expr])
+            submit_score = None#U.function(inputs=[comm_rounds, score_input], outputs=[comm_rounds_global], updates=[submit_score_expr])
 
             # Debugging functions
             q_values = U.function([obs_t_input], q_t)
             weights = U.function(inputs=[], outputs=[q_func_vars, global_q_func_vars, q_func_vars_old], updates=[])
             t_global_func = U.function([], t_global)
+            comm_rounds_func = U.function([], comm_rounds_global)
 
             return act_f, train, global_opt, update_target, update_weights, \
-                {'q_values': q_values, 'weights': weights, 't_global': t_global_func}
+                {'submit_score': submit_score, 'sync_opt_fraction': None, 'sync_opt_score': None,
+                 'check_round': None}, \
+                {'q_values': q_values, 'weights': weights, 't_global': t_global_func,
+                 'run_code': run_code_global, 'comm_rounds': comm_rounds_func}
 

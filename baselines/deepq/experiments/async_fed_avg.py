@@ -7,6 +7,8 @@ import argparse  # for parsing command line arguments... obviously
 import configparser  # for parsing the config ini file
 from datetime import datetime  # For generating timestamps for CSV files
 import csv  # for writing to CSV files... obviously
+import bisect  # for inserting into sorted lists
+import statistics  # for averaging and stuff
 
 import os  # for getting paths to this file
 sys.path.append(os.path.split(os.path.split(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))[0])[0])
@@ -38,31 +40,73 @@ env_name = "CartPole-v0"
 max_reward = 200
 
 
-def write_csv(file_name, episode, reward, avg_reward, t_global, dt, chief):
-    if chief:
+def write_csv(run_code, log, comm_rounds=False):
+    file_name = run_code + ("cr" if comm_rounds else "") + ".csv"
+    if log is not None:
         try:
-            with open(file_name + ".csv", 'a', newline='') as csv_file:
+            with open(file_name, 'a', newline='') as csv_file:
                 csv_writer = csv.writer(csv_file, delimiter=';')
-                if episode == 1:
-                    csv_writer.writerow(["episode", "reward", "avg_reward", "t_global", "dt"])
-                csv_writer.writerow([episode, reward, avg_reward, t_global, dt])
+                csv_writer.writerow(log)
         except PermissionError:
-            print("Permission error. CSV write failed: [", episode, reward, avg_reward, t_global, dt, "]")
+            print("Permission error. CSV write failed:", log)
 
 
-def write_csv_final(file_name, final_episode, round_log):
+def write_csv_final(file_name, final_episode, worker_hosts=None, chief=False):
     new_filename = file_name + "=" + str(final_episode) + "ep.csv"
-    with open(file_name + ".csv", 'r') as infile, open(new_filename, 'w', newline='') as outfile:
-        reader = csv.reader(infile)
-        writer = csv.writer(outfile, delimiter=';')
-        i = 0
-        for row in reader:
-            writer.writerow(row[0].split(";") + ([] if i >= len(round_log) else round_log[i]))
-            i += 1
+    os.rename(file_name + ".csv", new_filename)
+    # with open(file_name + ".csv", 'r', newline='') as infile, open(new_filename, 'w', newline='') as outfile:
+    #     reader = csv.reader(infile, delimiter=';')
+    #     writer = csv.writer(outfile, delimiter=';')
+    #     i = 0
+    #     for row in reader:
+    #         writer.writerow(row + ([] if i >= len(round_log) else round_log[i]))
+    #         i += 1
+    #
+    #     for a in round_log[i:]:
+    #         writer.writerow([None, None, None, None] + a)
+    # os.remove(file_name + ".csv")
+    if chief:
+        if all([host.find("localhost") >= 0 for host in worker_hosts]):
+            data = []
+            f1 = file_name.split("(w")[0]
+            files = []
+            print("All localhost. Chief combining files")
+            while len(files) < len(worker_hosts):
+                files = list(filter(lambda f: f.find(f1) >= 0 and f.find(")=") >= 0, os.listdir('.')))
+            print("Files to combine:", files)
+            for file in files:
+                buffer = []
+                with open(file, 'r', newline='') as infile:
+                    reader = csv.reader(infile, delimiter=';')
+                    buffer = [row for row in reader]
+                bisect.insort_left(data, buffer)
+            data_len = [len(x) for x in data]
+            print("Data of length", data_len, "\n", data)
+            summary_name = "{}=avg{}-med{}-sdv{}-min{}-max{}.csv"\
+                .format(file_name.split("(")[0], round(statistics.mean(data_len)),
+                        round(statistics.median(data_len)), round(statistics.stdev(data_len), 1),
+                        min(data_len), max(data_len))
+            with open(summary_name, 'w', newline='') as csv_file:
+                i = 0
+                csv_writer = csv.writer(csv_file, delimiter=';')
+                while i < max(data_len):
+                    writing = []
+                    for j in range(len(data)):
+                        if len(data[j]) <= i:
+                            writing += [i, 200, 200, 0, None]
+                        else:
+                            writing += data[j][i] + [None]
+                    # writing = list(itertools.chain.from_iterable([[i, 200, 200, 0, None] if len(run) > i else run[i] + [None] for run in data]))
+                    if i == 0:
+                        writing += ["avg_reward", "avg_avg_reward"]
+                    else:
+                        writing += [statistics.mean([float(x) for x in writing[1::5]]), statistics.mean([float(x) for x in writing[2::5]])]
+                    csv_writer.writerow(writing)
+                    i += 1
+            [os.remove(f) for f in files]
+        else:
+            print("Some hosts are not localhost, not combining files" + worker_hosts)
 
-        for a in round_log[i:]:
-            writer.writerow([None, None, None, None, None] + a)
-    os.remove(file_name + ".csv")
     print("Results saved in:  ", new_filename, sep='')
 
 
@@ -101,12 +145,14 @@ def main(_):
     alpha_decay = config.getint(FLAGS.config, 'alpha_decay')
     alpha = LinearSchedule(alpha_decay, end_alpha)
     backup = config.getint(FLAGS.config, 'backup')  # unused in async
+    sync = config.getboolean(FLAGS.config, 'sync')
+    gradient_prio = False if not sync else config.getboolean(FLAGS.config, 'gradient_prio')
 
     print("Config:\nps_hosts={}\nworker_hosts={}\njob_name={}\ntask_index={}\nlearning_rate={}\n"
           "batch_size={}\nmemory_size={}\ntarget_update={}\nseed={}\ncomm_rounds={}\nepochs={}\n"
-          "end_epoch={}\nepoch_decay={}\nend_alpha={}\nalpha_decay={}backup={}"
+          "end_epoch={}\nepoch_decay={}\nend_alpha={}\nalpha_decay={}\nbackup={}\nsync={}"
           .format(ps_hosts, worker_hosts, job, task, learning_rate, batch_size, memory_size, target_update,
-                  seed, max_comm_rounds, epochs, end_epoch, epoch_decay, end_alpha, alpha_decay, backup))
+                  seed, max_comm_rounds, epochs, end_epoch, epoch_decay, end_alpha, alpha_decay, backup, sync))
 
     cluster = tf.train.ClusterSpec({'ps': ps_hosts, 'worker': worker_hosts})
     chief = True if job == 'worker' and task == 0 else False
@@ -119,9 +165,10 @@ def main(_):
     seed += task
     random.seed(seed)
 
-    run_code = "{}-{}-p{}w{}-E{}-b{}-m{}-N{}-lr{}-B{}".\
+    run_code = "{}-{}-p{}w{}-E{}-b{}-m{}-N{}-lr{}-B{}-s{}".\
         format(datetime.now().strftime("%y%m%d-%H%M%S"), env_name, len(ps_hosts), len(worker_hosts),
-               epochs, batch_size, memory_size, target_update, learning_rate, backup)
+               epochs, batch_size, memory_size, target_update, learning_rate, backup, seed)
+    run_code += "-sync" if sync else "-async"
 
     print("Run code:", run_code)
 
@@ -130,14 +177,14 @@ def main(_):
         server.join()
 
     # Start training
-    with U.make_session(num_cpu=4, target=server.target):
+    with U.make_session(num_cpu=4, target=server.target) as sess:
         # Create the environment
         env = gym.make(env_name)
         env.seed(seed)
         tf.set_random_seed(seed)
 
         # Create all the functions necessary to train the model
-        act, train, global_opt, update_target, update_weights, debug = deepq.build_train(
+        act, train, global_opt,  update_target, update_weights, sync_opt, debug = deepq.build_train(
             make_obs_ph=lambda name: U.BatchInput(env.observation_space.shape, name=name),
             q_func=model,
             num_actions=env.action_space.n,
@@ -145,6 +192,7 @@ def main(_):
             # optimizer=tf.train.GradientDescentOptimizer(learning_rate=learning_rate),
             chief=chief,
             server=server,
+            workers=len(worker_hosts)-backup
         )
         # Create the replay buffer
         replay_buffer = ReplayBuffer(memory_size)
@@ -154,21 +202,38 @@ def main(_):
 
         if not chief:
             print("Worker {}/{} will sleep (3s) for chief to initialize variables".format(task+1, len(worker_hosts)))
-            time.sleep(3)
+            time.sleep(4)
 
         # Initialize the parameters and copy them to the target network.
         U.initialize(chief=chief)
 
+        if chief:
+            sess.run(debug['run_code'].assign(run_code))
+            print("Set global run code to:", run_code)
+
         print("initialized variables, sleeping for 1 sec")
-        time.sleep(1)
+        time.sleep(2)
+
+        if not chief:
+            while not sess.run(tf.is_variable_initialized(debug['run_code'])):
+                print("Global run code not yet initialized")
+                time.sleep(1)
+            run_code = str(sess.run(debug['run_code']).decode())
+            print("Read global run code:", run_code)
+
+        run_code += "(w" + str(task) + ")"
+        print("Final run_code:", run_code)
 
         t_global_old = update_weights()[0][0]
         update_target()
         exp_gen = 1000  # For how many timesteps sould we only generate experience (not train)
         t_start = exp_gen
         comm_rounds = 0
-        dt = [[0]]
-        round_log = [[None, "comm_rounds", "t", "staleness", "epoch"]]
+        comm_rounds_global = 0
+        dt = 0
+        write_csv(run_code, log=["episode", "reward" + str(task), "avg_reward" + str(task), "t_global"])
+        write_csv(run_code, log=["comm_rounds", "t" + str(task), "staleness" + str(task), "epoch" + str(task)],
+                  comm_rounds=True)
 
         episode_rewards = [0.0]
         obs = env.reset()
@@ -185,8 +250,7 @@ def main(_):
                 # if len(episode_rewards) % 10 == 0:
                 #     env.render()
                 avg_rew = np.round(np.mean(np.array(episode_rewards[-100:])), 1)
-                write_csv(run_code, len(episode_rewards), episode_rewards[-1], avg_rew, debug['t_global']()[0],
-                          dt[0][0], chief)
+                write_csv(run_code, [len(episode_rewards), episode_rewards[-1], avg_rew, debug['t_global']()[0]])
 
                 # Reset and prepare for next episode
                 obs = env.reset()
@@ -194,8 +258,7 @@ def main(_):
 
             is_solved = t > 100 and np.mean(episode_rewards[-101:-1]) >= max_reward
             if is_solved or comm_rounds >= max_comm_rounds:
-                if chief:
-                    write_csv_final(run_code, str(len(episode_rewards)), round_log)
+                write_csv_final(run_code, str(len(episode_rewards)), worker_hosts, chief)
                 print("Converged after:  ", len(episode_rewards), "episodes")
                 print("Agent total steps:", t)
                 print("Global steps:     ", debug['t_global']()[0])
@@ -210,18 +273,22 @@ def main(_):
                     if t - t_start >= np.round(epoch.value(comm_rounds)):  # The number of local timesteps to calculate before averaging gradients
                         # print("t = {}, Updating global network (t_global = {})".format(t, debug['t_global']()[0]))
 
+                        cr_old = comm_rounds_global
+
                         # Apply gradients to weights in PS
-                        dt = global_opt([t - t_start], [t_global_old], [alpha.value(comm_rounds)])
+                        if sync:
+                            # [comm_rounds_global] = global_sync_opt([cr_old], [gradient_prio])
+                            while cr_old == comm_rounds_global:
+                                # Get the current comm_round
+                                comm_rounds_global = debug['comm_rounds']()[0]
+                        else:
+                            [[dt], [comm_rounds_global]] = global_opt([t - t_start], [t_global_old], [cr_old], [alpha.value(comm_rounds)])
 
                         # Update the local weights with the new global weights from PS
                         t_global_old = update_weights()[0][0]
 
                         comm_rounds += 1
-                        round_log.append([None])
-                        round_log[-1].append(comm_rounds)
-                        round_log[-1].append(t)
-                        round_log[-1].append(dt[0][0])
-                        round_log[-1].append(epoch.value(comm_rounds))
+                        write_csv(run_code, [comm_rounds, t, dt, epoch.value(comm_rounds)], comm_rounds=True)
 
                         t_start = t
                         # epochs = end_epoch if epochs <= end_epoch else epochs - epoch_decay_rate
