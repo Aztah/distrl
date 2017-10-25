@@ -82,7 +82,7 @@ def write_csv_final(file_name, final_episode, worker_hosts=None, chief=False):
                 bisect.insort_left(data, buffer)
             data_len = [len(x) for x in data]
             print("Data of length", data_len, "\n", data)
-            summary_name = "{}=avg{}-med{}-sdv{}-min{}-max{}.csv"\
+            summary_name = "{}-avg-{}-med-{}-sdv-{}-min-{}-max-{}.csv"\
                 .format(file_name.split("(")[0], round(statistics.mean(data_len)),
                         round(statistics.median(data_len)), round(statistics.stdev(data_len), 1),
                         min(data_len), max(data_len))
@@ -141,18 +141,16 @@ def main(_):
     epoch_decay = config.getint(FLAGS.config, 'epoch_decay')
     # epoch_decay_rate = (epochs - end_epoch) / epoch_decay
     epoch = LinearSchedule(epoch_decay, end_epoch, epochs)
-    end_alpha = config.getfloat(FLAGS.config, 'end_alpha')
-    alpha_decay = config.getint(FLAGS.config, 'alpha_decay')
-    alpha = LinearSchedule(alpha_decay, end_alpha)
     backup = config.getint(FLAGS.config, 'backup')  # unused in async
     sync = config.getboolean(FLAGS.config, 'sync')
     gradient_prio = False if not sync else config.getboolean(FLAGS.config, 'gradient_prio')
+    sync_workers = len(worker_hosts)-backup
 
     print("Config:\nps_hosts={}\nworker_hosts={}\njob_name={}\ntask_index={}\nlearning_rate={}\n"
           "batch_size={}\nmemory_size={}\ntarget_update={}\nseed={}\ncomm_rounds={}\nepochs={}\n"
-          "end_epoch={}\nepoch_decay={}\nend_alpha={}\nalpha_decay={}\nbackup={}\nsync={}"
+          "end_epoch={}\nepoch_decay={}\nnbackup={}\nsync={}"
           .format(ps_hosts, worker_hosts, job, task, learning_rate, batch_size, memory_size, target_update,
-                  seed, max_comm_rounds, epochs, end_epoch, epoch_decay, end_alpha, alpha_decay, backup, sync))
+                  seed, max_comm_rounds, epochs, end_epoch, epoch_decay, backup, sync))
 
     cluster = tf.train.ClusterSpec({'ps': ps_hosts, 'worker': worker_hosts})
     chief = True if job == 'worker' and task == 0 else False
@@ -165,7 +163,7 @@ def main(_):
     seed += task
     random.seed(seed)
 
-    run_code = "{}-{}-p{}w{}-E{}-b{}-m{}-N{}-lr{}-B{}-s{}".\
+    run_code = "{}-{}-p-{}-w-{}-E-{}-b-{}-m-{}-N-{}-lr-{}-B-{}-s-{}-".\
         format(datetime.now().strftime("%y%m%d-%H%M%S"), env_name, len(ps_hosts), len(worker_hosts),
                epochs, batch_size, memory_size, target_update, learning_rate, backup, seed)
     run_code += "-sync" if sync else "-async"
@@ -192,7 +190,7 @@ def main(_):
             # optimizer=tf.train.GradientDescentOptimizer(learning_rate=learning_rate),
             chief=chief,
             server=server,
-            workers=len(worker_hosts)-backup
+            workers=sync_workers
         )
         # Create the replay buffer
         replay_buffer = ReplayBuffer(memory_size)
@@ -236,6 +234,7 @@ def main(_):
                   comm_rounds=True)
 
         episode_rewards = [0.0]
+        cr_reward = 0
         obs = env.reset()
         for t in itertools.count():
             # Take action and update exploration to the newest value
@@ -246,6 +245,7 @@ def main(_):
             obs = new_obs
 
             episode_rewards[-1] += rew
+            cr_reward += rew
             if done:
                 # if len(episode_rewards) % 10 == 0:
                 #     env.render()
@@ -276,18 +276,69 @@ def main(_):
                         cr_old = comm_rounds_global
 
                         # Apply gradients to weights in PS
+                        # TODO Sync the first 1000 rounds too! Not needed?
                         if sync:
-                            # [comm_rounds_global] = global_sync_opt([cr_old], [gradient_prio])
-                            while cr_old == comm_rounds_global:
-                                # Get the current comm_round
-                                comm_rounds_global = debug['comm_rounds']()[0]
+                            # Tell the ps we are done and want to submit score
+                            [[comm_rounds_global], [worker_count]] = sync_opt['request_submit']()
+
+                            if comm_rounds_global == comm_rounds:
+                                if worker_count <= sync_workers:
+                                    # If allowed to submit score, do it
+                                    [comm_rounds_global] = sync_opt['submit_score']([cr_reward])
+                                if worker_count == sync_workers:
+                                    # If it is the last submission of the round, start gradient update round
+                                    new_round = None
+                                if worker_count > sync_workers:
+                                    # If not allowed to submit score, wait for next round to start
+                                    target = np.floor(comm_rounds_global + 1)  # +1 if x.0, +0.5 if x.5
+                                    while not sync_opt['check_round']([target]):
+                                        pass
+
+                            if comm_rounds_global == comm_rounds + 0.5:
+                                # Submit Gradients
+                                pass
+
+                            if comm_rounds_global >= comm_rounds + 1:
+                                #
+                                pass
+
+                                    # # Submit our reward for this communication round
+                                    # [comm_rounds_global] = sync_opt['submit_score']([cr_old], [cr_reward])
+                                    # # If we are still on the same episode, it means we are allowed to submit gradients
+                                    # if cr_old == comm_rounds_global:
+                                    #     target = comm_rounds_global + 0.5
+                                    #     # Wait for the submit phase to begin (half comm round completed)
+                                    #     while not sync_opt['check_round'](target):
+                                    #         pass
+                                    #
+                                    #     # All sccores are collected, perform ONE sync opt
+                                    #     [[dt], [comm_rounds_global]] = global_opt([t - t_start], [t_global_old], [cr_old], [cr_reward], [gradient_prio])
+                                    #     target += 0.5
+                                    #
+                                    #     # This shoul never happen... but if it does, wait until the next round starts
+                                    #     if comm_rounds_global > target:
+                                    #         target = np.ceil(comm_rounds_global + 0.1)
+                                    #         while not sync_opt['check_target'](target):
+                                    #             pass
+                                    #
+                                    #     #Wait for the next round to start
+                                    #     while not sync_opt['check_round'](target):
+                                    #         pass
+                                    #
+                                    # # If we are not allowed to send gradients, wait for the next round to start
+                                    # else:
+                                    #     target = comm_rounds_global + 1
+                                    #     while not sync_opt['check_round'](target):
+                                    #         pass
+
                         else:
-                            [[dt], [comm_rounds_global]] = global_opt([t - t_start], [t_global_old], [cr_old], [alpha.value(comm_rounds)])
+                            [[dt], [comm_rounds_global]] = global_opt([t - t_start], [t_global_old], [cr_old], [0], [False])
 
                         # Update the local weights with the new global weights from PS
                         t_global_old = update_weights()[0][0]
 
                         comm_rounds += 1
+                        cr_reward = 0
                         write_csv(run_code, [comm_rounds, t, dt, epoch.value(comm_rounds)], comm_rounds=True)
 
                         t_start = t
