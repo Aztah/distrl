@@ -51,7 +51,7 @@ def write_csv(run_code, log, comm_rounds=False):
             print("Permission error. CSV write failed:", log)
 
 
-def write_csv_final(file_name, final_episode, worker_hosts=None, chief=False):
+def write_csv_final(file_name, final_episode, worker_hosts=None, chief=False, comm_rounds=0):
     new_filename = file_name + "=" + str(final_episode) + "ep.csv"
     os.rename(file_name + ".csv", new_filename)
     # with open(file_name + ".csv", 'r', newline='') as infile, open(new_filename, 'w', newline='') as outfile:
@@ -82,10 +82,11 @@ def write_csv_final(file_name, final_episode, worker_hosts=None, chief=False):
                 bisect.insort_left(data, buffer)
             data_len = [len(x) for x in data]
             print("Data of length", data_len, "\n", data)
-            summary_name = "{}-avg-{}-med-{}-sdv-{}-min-{}-max-{}.csv"\
+            summary_name = "{}-avg-{}-med-{}-sdv-{}-min-{}-max-{}-cr-{}.csv"\
                 .format(file_name.split("(")[0], round(statistics.mean(data_len)),
-                        round(statistics.median(data_len)), round(statistics.stdev(data_len), 1),
-                        min(data_len), max(data_len))
+                        round(statistics.median(data_len)),
+                        (round(statistics.stdev(data_len), 1) if len(data_len) > 1 else 0),
+                        min(data_len), max(data_len), int(comm_rounds))
             with open(summary_name, 'w', newline='') as csv_file:
                 i = 0
                 csv_writer = csv.writer(csv_file, delimiter=';')
@@ -93,14 +94,16 @@ def write_csv_final(file_name, final_episode, worker_hosts=None, chief=False):
                     writing = []
                     for j in range(len(data)):
                         if len(data[j]) <= i:
-                            writing += [i, 200, 200, 0, None]
+                            # This needs to be changed if data length changes
+                            writing += [i, 200, 200, 0, 0, None]
                         else:
                             writing += data[j][i] + [None]
                     # writing = list(itertools.chain.from_iterable([[i, 200, 200, 0, None] if len(run) > i else run[i] + [None] for run in data]))
                     if i == 0:
                         writing += ["avg_reward", "avg_avg_reward"]
                     else:
-                        writing += [statistics.mean([float(x) for x in writing[1::5]]), statistics.mean([float(x) for x in writing[2::5]])]
+                        # This needs to be changed if data length changes
+                        writing += [statistics.mean([float(x) for x in writing[1::6]]), statistics.mean([float(x) for x in writing[2::6]])]
                     csv_writer.writerow(writing)
                     i += 1
             [os.remove(f) for f in files]
@@ -229,7 +232,7 @@ def main(_):
         comm_rounds = 0
         comm_rounds_global = 0
         dt = 0
-        write_csv(run_code, log=["episode", "reward" + str(task), "avg_reward" + str(task), "t_global"])
+        write_csv(run_code, log=["episode", "reward" + str(task), "avg_reward" + str(task), "t_global", "cr"])
         write_csv(run_code, log=["comm_rounds", "t" + str(task), "staleness" + str(task), "epoch" + str(task)],
                   comm_rounds=True)
 
@@ -250,15 +253,18 @@ def main(_):
                 # if len(episode_rewards) % 10 == 0:
                 #     env.render()
                 avg_rew = np.round(np.mean(np.array(episode_rewards[-100:])), 1)
-                write_csv(run_code, [len(episode_rewards), episode_rewards[-1], avg_rew, debug['t_global']()[0]])
+                write_csv(run_code, [len(episode_rewards), episode_rewards[-1], avg_rew, debug['t_global']()[0], comm_rounds_global])
 
                 # Reset and prepare for next episode
                 obs = env.reset()
                 episode_rewards.append(0)
 
-            is_solved = t > 100 and np.mean(episode_rewards[-101:-1]) >= max_reward
+            [converged] = sync_opt['check_converged']()
+            is_solved = t > 100 and np.mean(episode_rewards[-101:-1]) >= max_reward or converged
             if is_solved or comm_rounds >= max_comm_rounds:
-                write_csv_final(run_code, str(len(episode_rewards)), worker_hosts, chief)
+                sync_opt['set_converged']([True])
+                print("Converged was set to", sync_opt['check_converged']()[0])
+                write_csv_final(run_code, str(len(episode_rewards)), worker_hosts, chief, comm_rounds_global)
                 print("Converged after:  ", len(episode_rewards), "episodes")
                 print("Agent total steps:", t)
                 print("Global steps:     ", debug['t_global']()[0])
@@ -276,68 +282,106 @@ def main(_):
                         cr_old = comm_rounds_global
 
                         # Apply gradients to weights in PS
-                        # TODO Sync the first 1000 rounds too! Not needed?
                         if sync:
                             # Tell the ps we are done and want to submit score
                             [[comm_rounds_global], [worker_count]] = sync_opt['request_submit']()
+                            # print("Checking if CRG(", comm_rounds_global, ") = CR(", comm_rounds, ")", sep="")
 
                             if comm_rounds_global == comm_rounds:
+                                # print("Checking if WC(", worker_count, ") <= n(", sync_workers, ")", sep="")
                                 if worker_count <= sync_workers:
                                     # If allowed to submit score, do it
                                     [comm_rounds_global] = sync_opt['submit_score']([cr_reward])
-                                if worker_count == sync_workers:
-                                    # If it is the last submission of the round, start gradient update round
-                                    new_round = None
-                                if worker_count > sync_workers:
-                                    # If not allowed to submit score, wait for next round to start
-                                    target = np.floor(comm_rounds_global + 1)  # +1 if x.0, +0.5 if x.5
-                                    while not sync_opt['check_round']([target]):
+
+                                    # print("WC Safe:", worker_count, "<=", sync_workers)
+
+                                    if chief: #worker_count == sync_workers:
+                                        # print("Chief done: round", comm_rounds_global)
+                                        # If it is the last submission of the round, start gradient update round
+                                        [submits] = sync_opt['set_submit']([0])
+                                        while worker_count != sync_workers:
+                                            if sync_opt['check_converged']()[0]:
+                                                print("Other worker converged! Finishing in check_wc")
+                                                break
+                                            worker_count = sync_opt['check_wc']()[0]
+
+                                    while sync_opt['check_submit']()[0] == -1:
+                                        if sync_opt['check_converged']()[0]:
+                                            print("Other worker converged! Finishing in check_submit")
+                                            break
+                                        # print("Waiting for submit to start")
+                                        # time.sleep(0.1)
                                         pass
 
-                            if comm_rounds_global == comm_rounds + 0.5:
-                                # Submit Gradients
-                                pass
+                                    if sync_opt['check_converged']()[0]:
+                                        print("Other worker converged! Continuing before submit")
+                                        continue
 
-                            if comm_rounds_global >= comm_rounds + 1:
-                                #
-                                pass
+                                    # Now all eligible workers have sent their score and gradient round has started
+                                    # Submit gradient
+                                    # TODO 4th argument overrides everything else unles it is set to -1 in the code
+                                    [[dt], [comm_rounds_global], [factor]] = global_opt([t - t_start], [t_global_old],
+                                                                              [cr_reward], [1/len(worker_hosts)], [True])
 
-                                    # # Submit our reward for this communication round
-                                    # [comm_rounds_global] = sync_opt['submit_score']([cr_old], [cr_reward])
-                                    # # If we are still on the same episode, it means we are allowed to submit gradients
-                                    # if cr_old == comm_rounds_global:
-                                    #     target = comm_rounds_global + 0.5
-                                    #     # Wait for the submit phase to begin (half comm round completed)
-                                    #     while not sync_opt['check_round'](target):
-                                    #         pass
-                                    #
-                                    #     # All sccores are collected, perform ONE sync opt
-                                    #     [[dt], [comm_rounds_global]] = global_opt([t - t_start], [t_global_old], [cr_old], [cr_reward], [gradient_prio])
-                                    #     target += 0.5
-                                    #
-                                    #     # This shoul never happen... but if it does, wait until the next round starts
-                                    #     if comm_rounds_global > target:
-                                    #         target = np.ceil(comm_rounds_global + 0.1)
-                                    #         while not sync_opt['check_target'](target):
-                                    #             pass
-                                    #
-                                    #     #Wait for the next round to start
-                                    #     while not sync_opt['check_round'](target):
-                                    #         pass
-                                    #
-                                    # # If we are not allowed to send gradients, wait for the next round to start
-                                    # else:
-                                    #     target = comm_rounds_global + 1
-                                    #     while not sync_opt['check_round'](target):
-                                    #         pass
+                                    submits = sync_opt['inc_submit']()
+                                    # print("Score=", cr_reward, " Submits=", submits[0][0], " t=", t-t_start,
+                                    #       " t_global_old=", t_global_old, " cr_old=", cr_old,
+                                    #       " cr_global=", comm_rounds_global, " dt=", dt, " factor=", factor, sep='')
+
+                                    # Chief waits until submits = n
+                                    if chief:
+                                        while not sync_opt['check_submit']()[0] == sync_workers:
+                                            if sync_opt['check_converged']()[0]:
+                                                print("Other worker converged! Finishing in check_submit (chief)")
+                                                break
+                                            # print("Chief waiting for all submits", sync_opt['check_submit']()[0], "!=", sync_workers)
+                                            #time.sleep(5)
+                                            pass
+                                        # print("Round", comm_rounds, "finished")
+                                        [w] = sync_opt['reset_wc']()[0]
+                                        # print("Worker count reset to:", w)
+                                        sync_opt['reset_score']()
+                                        submits = sync_opt['set_submit']([-1])
+                                        # print("Submit round finished. Submits set to:", submits[0])
+                                        [r] = sync_opt['inc_comm_round']()[0]
+                                        # print("New round started:", r)
+
+                                    # Normal workers wait until GCR > CR
+                                    if not chief:
+                                        while sync_opt['check_round']()[0] <= comm_rounds:
+                                            if sync_opt['check_converged']()[0]:
+                                                print("Other worker converged! Finishing in check_round")
+                                                break
+                                            # print("Worker submitted, waiting for next round:", comm_rounds + 1)
+                                            # time.sleep(0.1)
+                                            pass
+
+                                else: #elif worker_count > sync_workers:
+                                    # If not allowed to submit score, wait for next round to start
+                                    print("Worker finished too late but before new round started (", comm_rounds_global, ")")
+                                    print("WC(", worker_count, ") > N(", sync_workers, ")", sep="")
+                                    target = np.floor(comm_rounds_global + 1)  # +1 if x.0, +0.5 if x.5
+                                    while not sync_opt['check_round']()[0] >= target:
+                                        pass
+
+                            elif comm_rounds_global > comm_rounds:
+                                # This means the worker is behind. Do nothing and start next round
+                                print("Communication round ", comm_rounds, "missed. Actual round:", comm_rounds_global)
+                                # TODO How to handle round count when skipping rounds?
+                                comm_rounds = comm_rounds_global - 1
+
+                            elif comm_rounds_global < comm_rounds:
+                                print("WARNING! Worker ahead of global:", comm_rounds, ">", comm_rounds_global)
+                                time.sleep(5)
 
                         else:
-                            [[dt], [comm_rounds_global]] = global_opt([t - t_start], [t_global_old], [cr_old], [0], [False])
+                            [[dt], [comm_rounds_global], [factor]] = global_opt([t - t_start], [t_global_old], [0], [-1], [False])
 
                         # Update the local weights with the new global weights from PS
                         t_global_old = update_weights()[0][0]
 
                         comm_rounds += 1
+                        # print("Round finished. Increasing local comm_round to:", comm_rounds)
                         cr_reward = 0
                         write_csv(run_code, [comm_rounds, t, dt, epoch.value(comm_rounds)], comm_rounds=True)
 
@@ -358,9 +402,19 @@ def main(_):
                 logger.record_tabular("% time spent exploring", int(100 * exploration.value(t)))
                 # logger.record_tabular("last gradient factor", np.round(factor, 4))
                 logger.dump_tabular()
-                print("[" + ''.join(
-                    ['●' if x >= max_reward else str(int(np.floor(x / (max_reward/10)))) if x >= (max_reward/10) else '_' for x in last_rewards])
-                      + "] (" + str(last_rewards.count(max_reward)) + "/", len(last_rewards), ")", sep='')
+                rew_ill = ['●' if x >= max_reward else str(int(np.floor(x / (max_reward/10)))) if x >= (max_reward/10) else '_' for x in last_rewards]
+                streak = 0
+                for i in reversed(rew_ill):
+                    if i == "●":
+                        streak += 1
+                    else:
+                        break
+                print("[" + ''.join(rew_ill) + "] ([● " + str(rew_ill.count('●')) + " | " + str(rew_ill.count('9')) +
+                      " | " + str(rew_ill.count('8')) + " | " + str(rew_ill.count('7')) +
+                      " | " + str(rew_ill.count('6')) + " | " + str(rew_ill.count('5')) +
+                      " | " + str(rew_ill.count('4')) + " | " + str(rew_ill.count('3')) +
+                      " | " + str(rew_ill.count('2')) + " | " + str(rew_ill.count('1')) +
+                      " | " + str(rew_ill.count('_')) + " _]/" + str(len(rew_ill)) + " {S:" + str(streak) + "})", sep='')
 
 
 if __name__ == "__main__":

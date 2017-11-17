@@ -196,9 +196,10 @@ def build_train(make_obs_ph, q_func, num_actions, optimizer, chief=False, server
             # Local timestep counters
             t = tf.placeholder(tf.float32, [1], name="t")
             t_global_old = tf.placeholder(tf.float32, [1], name="t_global_old")
-            comm_rounds = tf.placeholder(tf.float32, [1], name="comm_rounds")
             score_input = tf.placeholder(tf.float32, [1], name="score_input")
             grad_prio = tf.placeholder(tf.bool, [1], name="grad_prio")
+            converged_ph = tf.placeholder(tf.bool, [1], name="converged")
+            factor_input = tf.placeholder(tf.float32, [1], name="factor_input")
 
             # Global timestep counter
             # TODO Does TF have built-in global step counters?
@@ -208,7 +209,10 @@ def build_train(make_obs_ph, q_func, num_actions, optimizer, chief=False, server
                 comm_rounds_global = tf.Variable(dtype=tf.float32, initial_value=[0], name="comm_rounds_global")
                 max_workers_global = tf.constant(workers, dtype=tf.float32, name="max_workers_global")
                 worker_count_global = tf.Variable(dtype=tf.float32, initial_value=[0], name="worker_count_global")
-                score_global = tf.Variable(dtype=tf.float32, initial_value=[0], name="score_global")
+                score_max_global = tf.Variable(dtype=tf.float32, initial_value=[0], name="score_max_global")
+                score_min_global = tf.Variable(dtype=tf.float32, initial_value=[0], name="score_min_global")
+                submit_count_global = tf.Variable(dtype=tf.float32, initial_value=[-1], name="submit_count_global")
+                converged_global = tf.Variable(dtype=tf.bool, initial_value=[False], name="converged_global")
 
             # q network evaluation
             q_t = q_func(obs_t_input.get(), num_actions, scope="q_func", reuse=True)  # reuse parameters from act
@@ -302,7 +306,12 @@ def build_train(make_obs_ph, q_func, num_actions, optimizer, chief=False, server
             # Factor to multiply every gradient with
             # f = t / (t_global - t_global_old)
             dt = tf.subtract(update_t_global, t_global_old)
-            factor = tf.where(grad_prio, tf.divide(score_input, score_global), tf.div(t, dt))
+            factor = tf.where(tf.greater_equal(factor_input, 0),
+                              factor_input,
+                              tf.where(grad_prio,
+                              tf.divide(tf.subtract(score_input, score_min_global),
+                                        tf.subtract(score_max_global, score_min_global)),
+                              tf.div(t, dt)))
             for var, var_old, var_global in zip(sorted(q_func_vars, key=lambda v: v.name),
                                                 sorted(q_func_vars_old, key=lambda v: v.name),
                                                 sorted(global_q_func_vars, key=lambda v: v.name)):
@@ -354,10 +363,22 @@ def build_train(make_obs_ph, q_func, num_actions, optimizer, chief=False, server
             # submit_score_expr = score_global.assign_add(score_input)
 
             # This only saves the maximum score (for normalized score weighting)
-            submit_score_expr = score_global.assign(tf.maximum(score_input, score_global))
+            submit_score_max = score_max_global.assign(tf.maximum(score_input, score_max_global), use_locking=True)
+            submit_score_min = score_min_global.assign(tf.minimum(score_input, score_min_global), use_locking=True)
 
-            check_round_op = tf.equal(comm_rounds, comm_rounds_global)
+            set_submit_count = submit_count_global.assign(score_input, use_locking=True)
+            inc_submit_count = submit_count_global.assign_add([1], use_locking=True)
+
+            # check_round_op = tf.equal(comm_rounds, comm_rounds_global) # Not used anymore
             inc_wc = worker_count_global.assign_add([1], use_locking=True)
+            zero_wc = worker_count_global.assign([0], use_locking=True)
+
+            inc_cr = comm_rounds_global.assign_add([1], use_locking=True)
+
+            score_reset = score_max_global.assign([0], use_locking=True)
+
+            converged_set = converged_global.assign(converged_ph, use_locking=True)
+
 
             # Create callable functions
             train = U.function(
@@ -372,13 +393,22 @@ def build_train(make_obs_ph, q_func, num_actions, optimizer, chief=False, server
                 outputs=[td_error],
                 updates=[optimize_expr]
             )
-            global_opt = U.function(inputs=[t, t_global_old, comm_rounds, score_input, grad_prio], outputs=[dt, comm_rounds_global], updates=[optimize_global_expr])
+            global_opt = U.function(inputs=[t, t_global_old, score_input, factor_input, grad_prio], outputs=[dt, comm_rounds_global, factor], updates=[optimize_global_expr])
             # global_sync_opt = U.function(inputs=[comm_rounds], outputs=[comm_rounds_global], updates=[optimize_global_sync_expr])
             update_weights = U.function(inputs=[], outputs=[t_global], updates=[update_global_expr])
             update_target = U.function([], [], updates=[update_target_expr])
-            submit_score = U.function(inputs=[score_input], outputs=[comm_rounds_global], updates=[submit_score_expr])
-            check_round = U.function(inputs=[comm_rounds], outputs=[check_round_op], updates=[])
-            request_submit = U.function(inputs=[], outputs=[comm_rounds_global, worker_count_global], updates=[inc_wc])
+            submit_score = U.function(inputs=[score_input], outputs=[comm_rounds_global], updates=[submit_score_max, submit_score_min])
+            check_round = U.function(inputs=[], outputs=[comm_rounds_global], updates=[])
+            request_submit = U.function(inputs=[], outputs=[comm_rounds_global, inc_wc], updates=[])
+            set_submit = U.function(inputs=[score_input], outputs=[set_submit_count], updates=[])
+            check_submit = U.function(inputs=[], outputs=[submit_count_global], updates=[])
+            inc_submit = U.function(inputs=[], outputs=[inc_submit_count], updates=[])
+            inc_comm_round = U.function(inputs=[], outputs=[inc_cr], updates=[])
+            reset_wc = U.function(inputs=[], outputs=[zero_wc], updates=[])
+            check_wc = U.function(inputs=[], outputs=[worker_count_global], updates=[])
+            reset_score = U.function(inputs=[], outputs=[], updates=[score_reset])
+            set_converged = U.function(inputs=[converged_ph], outputs=[], updates=[converged_set])
+            check_converged = U.function(inputs=[], outputs=[converged_global], updates=[])
 
             # Debugging functions
             q_values = U.function([obs_t_input], q_t)
@@ -387,8 +417,11 @@ def build_train(make_obs_ph, q_func, num_actions, optimizer, chief=False, server
             comm_rounds_func = U.function([], comm_rounds_global)
 
             return act_f, train, global_opt, update_target, update_weights, \
-                {'request_submit': request_submit, 'submit_score': submit_score, 'fraction_opt': None,
-                 'score_opt': None, 'check_round': check_round}, \
+                {'request_submit': request_submit, 'submit_score': submit_score,
+                 'check_round': check_round, 'check_submit': check_submit, 'set_submit': set_submit,
+                 'inc_submit': inc_submit, 'inc_comm_round': inc_comm_round, 'reset_wc': reset_wc,
+                 'check_wc': check_wc, 'reset_score': reset_score,
+                 'set_converged': set_converged, 'check_converged': check_converged}, \
                 {'q_values': q_values, 'weights': weights, 't_global': t_global_func,
-                 'run_code': run_code_global, 'comm_rounds': comm_rounds_func}
+                 'run_code': run_code_global, 'comm_rounds': comm_rounds_func, 'factor': factor}
 
