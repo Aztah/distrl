@@ -76,10 +76,21 @@ def write_csv_final(file_name, final_episode, worker_hosts=None, chief=False, co
             print("Files to combine:", files)
             for file in files:
                 buffer = []
-                with open(file, 'r', newline='') as infile:
-                    reader = csv.reader(infile, delimiter=';')
-                    buffer = [row for row in reader]
-                bisect.insort_left(data, buffer)
+                # TODO fix permission error: PermissionError: [Errno 13] Permission denied
+                for attempt in range(100):
+                    try:
+                        with open(file, 'r', newline='') as infile:
+                            reader = csv.reader(infile, delimiter=';')
+                            buffer = [row for row in reader]
+                        bisect.insort_left(data, buffer)
+                    except PermissionError as e:
+                        print("Could not open file ", file, " Permission error(", attempt, "):", e.strerror, sep='')
+                        time.sleep(5)
+                        continue
+                    else:
+                        break
+                else:
+                    print("All failed. Some files will not be combined.")
             data_len = [len(x) for x in data]
             print("Data of length", data_len, "\n", data)
             summary_name = "{}-avg-{}-med-{}-sdv-{}-min-{}-max-{}-cr-{}.csv"\
@@ -128,6 +139,7 @@ def main(_):
     print("Used flags:", FLAGS)
     config = configparser.ConfigParser()
     config.read(FLAGS.config_file)
+    timer = time.time()
 
     ps_hosts = config.get(FLAGS.config, 'ps_hosts').split(",")
     worker_hosts = config.get(FLAGS.config, 'worker_hosts').split(",")
@@ -218,8 +230,11 @@ def main(_):
         if not chief:
             while not sess.run(tf.is_variable_initialized(debug['run_code'])):
                 print("Global run code not yet initialized")
-                time.sleep(1)
+                time.sleep(2)
             run_code = str(sess.run(debug['run_code']).decode())
+            if run_code == '':
+                print("Run code empty. Trying to fetch again...")
+                time.sleep(5)
             print("Read global run code:", run_code)
 
         run_code += "(w" + str(task) + ")"
@@ -268,6 +283,8 @@ def main(_):
                 print("Converged after:  ", len(episode_rewards), "episodes")
                 print("Agent total steps:", t)
                 print("Global steps:     ", debug['t_global']()[0])
+                sec = round(time.time() - timer)
+                print("Total time:", sec // 3600, "h", (sec % 3600) // 60, "min", sec % 60, "s")
                 return
             else:
                 # Minimize the error in Bellman's equation on a batch sampled from replay buffer.
