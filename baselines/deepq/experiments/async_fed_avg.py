@@ -248,8 +248,9 @@ def main(_):
         comm_rounds_global = 0
         dt = 0
         write_csv(run_code, log=["episode", "reward" + str(task), "avg_reward" + str(task), "t_global", "cr"])
-        write_csv(run_code, log=["comm_rounds", "t" + str(task), "staleness" + str(task), "epoch" + str(task)],
-                  comm_rounds=True)
+        # TODO RE-ENABLE comm-rounds LOGGING
+        # write_csv(run_code, log=["comm_rounds", "t" + str(task), "staleness" + str(task), "epoch" + str(task)],
+        #           comm_rounds=True)
 
         episode_rewards = [0.0]
         cr_reward = 0
@@ -400,7 +401,8 @@ def main(_):
                         comm_rounds += 1
                         # print("Round finished. Increasing local comm_round to:", comm_rounds)
                         cr_reward = 0
-                        write_csv(run_code, [comm_rounds, t, dt, epoch.value(comm_rounds)], comm_rounds=True)
+                        # TODO RE-ENABLE comm-rounds LOGGING
+                        # write_csv(run_code, [comm_rounds, t, dt, epoch.value(comm_rounds)], comm_rounds=True)
 
                         t_start = t
                         # epochs = end_epoch if epochs <= end_epoch else epochs - epoch_decay_rate
