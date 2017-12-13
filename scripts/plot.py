@@ -1,4 +1,5 @@
-import matplotlib
+import matplotlib.pyplot as plt
+import numpy as np
 import csv
 import statistics
 import os
@@ -88,9 +89,69 @@ def write_csv_final(file_name, final_episode, worker_hosts=None, chief=False, co
 
     print("Results saved in:  ", new_filename, sep='')
 
-def merge_cr(identifier):
-    pass
 
-def plot_experiment(identifier):
-    data = []
-    pass
+def parse_folder(path, file_ident="-avg-"):
+    files = list(filter(lambda f: f.find(file_ident) >= 0, os.listdir(path)))
+    # files = list(filter(lambda f: f.find(f1) >= 0 and f.find(")=") >= 0, os.listdir('.')))
+    [print(x) for x in files]
+    tok = np.array([list(filter(None, '.'.join(x.split('.')[:-1]).split('-'))) for x in files])
+
+    print("Tok before")
+    [print(x) for x in tok]
+
+    dat = {}
+    dat['time'] = tok[:, 0:1]
+    dat['env'] = tok[:, 2:3]
+    dat['sync'] = tok[:, 22]
+    tok = np.array([np.delete(x, [0, 1, 2, 3, 22]) for x in tok])
+
+    # print("Tok after")
+    # [print(x) for x in tok]
+
+    for i in range(0, len(tok[0]), 2):
+        try:
+            dat[tok[0][i]] = [int(x) for x in tok[:, i + 1]]
+        except ValueError:
+            dat[tok[0][i]] = [float(x) for x in tok[:, i + 1]]
+        print(tok[0][i], "=", dat[tok[0][i]])
+
+    return dat
+
+
+def plot_experiment(folder='../results/sync-exp', subfolder_mask='E-1-', file_ident="-avg-"):
+    path = os.path.abspath(folder)
+    print("Path =", path)
+    folders = list(filter(lambda f: f.find(subfolder_mask) >= 0, os.listdir(folder)))
+    print("Folders =", folders)
+    paths = [path + "/" + x for x in folders]
+    print("Paths =", paths)
+
+    dat = parse_folder(paths[0])
+
+    plt.plot(dat['w'], dat['avg'])
+    plt.plot(dat['w'], dat['med'])
+    plt.plot(dat['w'], dat['min'])
+    plt.plot(dat['w'], dat['max'])
+    plt.xlabel('x')
+    plt.ylabel('y')
+    plt.title('Super Graph')
+    plt.grid(True)
+    plt.savefig("test.png")
+    plt.show()
+
+    # from mpl_toolkits.mplot3d import axes3d
+    # import matplotlib.pyplot as plt
+    #
+    # fig = plt.figure()
+    # ax = fig.add_subplot(111, projection='3d')
+    #
+    # # Grab some test data.
+    # X, Y, Z = axes3d.get_test_data(0.05)
+    #
+    # # Plot a basic wireframe.
+    # ax.plot_wireframe(X, Y, Z, rstride=10, cstride=10)
+    #
+    # plt.show()
+
+if __name__ == "__main__":
+    plot_experiment()
