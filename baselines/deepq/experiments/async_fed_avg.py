@@ -144,8 +144,8 @@ def main(_):
     config.read(FLAGS.config_file)
     timer = time.time()
 
-    ps_hosts = config.get(FLAGS.config, 'ps_hosts').split(",")
-    worker_hosts = config.get(FLAGS.config, 'worker_hosts').split(",")
+    ps_hosts = FLAGS.ps_hosts.split(",") if FLAGS.ps_hosts else config.get(FLAGS.config, 'ps_hosts').split(",")
+    worker_hosts = FLAGS.worker_hosts.split(",") if FLAGS.worker_hosts else config.get(FLAGS.config, 'worker_hosts').split(",")
     job = FLAGS.job_name
     task = FLAGS.task_index
     learning_rate = config.getfloat(FLAGS.config, 'learning_rate')
@@ -180,14 +180,14 @@ def main(_):
     # Create server
     server = tf.train.Server(cluster, job_name=job, task_index=task)
 
-    # Set a unique random seed for each client
-    seed = ((seed * 10) + task)
-    random.seed(seed)
-
     run_code = "{}-{}-p-{}-w-{}-E-{}-b-{}-m-{}-N-{}-lr-{}-B-{}-s-{}-".\
         format(datetime.now().strftime("%y%m%d-%H%M%S"), env_name, len(ps_hosts), len(worker_hosts),
                epochs, batch_size, memory_size, target_update, learning_rate, backup, seed)
     run_code += "-sync" if sync else "-async"
+
+    # Set a unique random seed for each client
+    seed = ((seed * 10) + task)
+    random.seed(seed)
 
     if not mute:
         print("Run code:", run_code)
@@ -467,6 +467,16 @@ def main(_):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.register("type", "bool", lambda v: v.lower() == "true")
+    parser.add_argument(
+        "--ps_hosts",
+        type=str,
+        help="Comma-separated list of hostname:port pairs"
+    )
+    parser.add_argument(
+        "--worker_hosts",
+        type=str,
+        help="Comma-separated list of hostname:port pairs"
+    )
     parser.add_argument(
         "--config_file",
         type=str,
