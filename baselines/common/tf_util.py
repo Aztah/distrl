@@ -243,7 +243,7 @@ def initialize(chief=True):
         new_variables = set(filter(lambda x: "global" not in x.name, new_variables))
     # print("Initializing", len(new_variables), "vars:")
     names = [x.name + "  -  " + x.device for x in new_variables]
-    print(*sorted(names), sep='\n')
+    # print(*sorted(names), sep='\n')
     # print("Vars done")
     get_session().run(tf.variables_initializer(new_variables))
     ALREADY_INITIALIZED.update(new_variables)
