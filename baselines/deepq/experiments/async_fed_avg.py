@@ -51,7 +51,7 @@ def write_csv(run_code, log, comm_rounds=False):
             print("Permission error. CSV write failed:", log)
 
 
-def write_csv_final(file_name, final_episode, worker_hosts=None, chief=False, comm_rounds=0):
+def write_csv_final(file_name, final_episode, worker_hosts=None, chief=False, comm_rounds=0, mute=False):
     new_filename = file_name + "=" + str(final_episode) + "ep.csv"
     os.rename(file_name + ".csv", new_filename)
     # with open(file_name + ".csv", 'r', newline='') as infile, open(new_filename, 'w', newline='') as outfile:
@@ -70,10 +70,12 @@ def write_csv_final(file_name, final_episode, worker_hosts=None, chief=False, co
             data = []
             f1 = file_name.split("(w")[0]
             files = []
-            print("All localhost. Chief combining files")
+            if not mute:
+                print("All localhost. Chief combining files")
             while len(files) < len(worker_hosts):
                 files = list(filter(lambda f: f.find(f1) >= 0 and f.find(")=") >= 0, os.listdir('.')))
-            print("Files to combine:", files)
+            if not mute:
+                print("Files to combine:", files)
             for file in files:
                 buffer = []
                 # TODO fix permission error: PermissionError: [Errno 13] Permission denied
@@ -92,7 +94,8 @@ def write_csv_final(file_name, final_episode, worker_hosts=None, chief=False, co
                 else:
                     print("All failed. Some files will not be combined.")
             data_len = [len(x) for x in data]
-            print("Data of length", data_len, "\n", data)
+            if not mute:
+                print("Data of length", data_len, "\n", data)
             summary_name = "{}-avg-{}-med-{}-sdv-{}-min-{}-max-{}-cr-{}.csv"\
                 .format(file_name.split("(")[0], round(statistics.mean(data_len)),
                         round(statistics.median(data_len)),
@@ -160,6 +163,9 @@ def main(_):
     sync = config.getboolean(FLAGS.config, 'sync')
     gradient_prio = False if not sync else config.getboolean(FLAGS.config, 'gradient_prio')
     sync_workers = len(worker_hosts)-backup
+    mute = FLAGS.mute if FLAGS.mute else config.getboolean(FLAGS.config, 'mute')
+    animate = 0
+    draw = 0
 
     print("Config:\nps_hosts={}\nworker_hosts={}\njob_name={}\ntask_index={}\nlearning_rate={}\n"
           "batch_size={}\nmemory_size={}\ntarget_update={}\nseed={}\ncomm_rounds={}\nepochs={}\n"
@@ -175,7 +181,7 @@ def main(_):
     server = tf.train.Server(cluster, job_name=job, task_index=task)
 
     # Set a unique random seed for each client
-    seed += task
+    seed = ((seed * 10) + task)
     random.seed(seed)
 
     run_code = "{}-{}-p-{}-w-{}-E-{}-b-{}-m-{}-N-{}-lr-{}-B-{}-s-{}-".\
@@ -183,7 +189,8 @@ def main(_):
                epochs, batch_size, memory_size, target_update, learning_rate, backup, seed)
     run_code += "-sync" if sync else "-async"
 
-    print("Run code:", run_code)
+    if not mute:
+        print("Run code:", run_code)
 
     # Start parameter servers
     if job == 'ps':
@@ -214,7 +221,8 @@ def main(_):
         exploration = LinearSchedule(schedule_timesteps=10000, initial_p=1.0, final_p=0.02)
 
         if not chief:
-            print("Worker {}/{} will sleep (3s) for chief to initialize variables".format(task+1, len(worker_hosts)))
+            if not mute:
+                print("Worker {}/{} will sleep (3s) for chief to initialize variables".format(task+1, len(worker_hosts)))
             time.sleep(4)
 
         # Initialize the parameters and copy them to the target network.
@@ -222,20 +230,25 @@ def main(_):
 
         if chief:
             sess.run(debug['run_code'].assign(run_code))
-            print("Set global run code to:", run_code)
+            if not mute:
+                print("Set global run code to:", run_code)
 
-        print("initialized variables, sleeping for 1 sec")
+        if not mute:
+            print("initialized variables, sleeping for 1 sec")
         time.sleep(2)
 
         if not chief:
             while not sess.run(tf.is_variable_initialized(debug['run_code'])):
-                print("Global run code not yet initialized")
+                if not mute:
+                    print("Global run code not yet initialized")
                 time.sleep(2)
             run_code = str(sess.run(debug['run_code']).decode())
             if run_code == '':
-                print("Run code empty. Trying to fetch again...")
+                if not mute:
+                    print("Run code empty. Trying to fetch again...")
                 time.sleep(5)
-            print("Read global run code:", run_code)
+            if not mute:
+                print("Read global run code:", run_code)
 
         run_code += "(w" + str(task) + ")"
         print("Final run_code:", run_code)
@@ -265,9 +278,16 @@ def main(_):
 
             episode_rewards[-1] += rew
             cr_reward += rew
+
+            # Animate every <animate> episodes
+            if not mute and chief and animate > 0 and (len(episode_rewards) % animate) == 0:
+                if done:
+                    print("ep", len(episode_rewards), "ended with reward:", episode_rewards[-1])
+                env.render()
+
             if done:
-                # if len(episode_rewards) % 10 == 0:
-                #     env.render()
+                if not mute and chief and draw > 0 and len(episode_rewards) % draw == 0:
+                    env.render()
                 avg_rew = np.round(np.mean(np.array(episode_rewards[-100:])), 1)
                 write_csv(run_code, [len(episode_rewards), episode_rewards[-1], avg_rew, debug['t_global']()[0], comm_rounds_global])
 
@@ -279,8 +299,9 @@ def main(_):
             is_solved = t > 100 and np.mean(episode_rewards[-101:-1]) >= max_reward or converged
             if is_solved or comm_rounds >= max_comm_rounds:
                 sync_opt['set_converged']([True])
-                print("Converged was set to", sync_opt['check_converged']()[0])
-                write_csv_final(run_code, str(len(episode_rewards)), worker_hosts, chief, comm_rounds_global)
+                if not mute:
+                    print("Converged was set to", sync_opt['check_converged']()[0])
+                write_csv_final(run_code, str(len(episode_rewards)), worker_hosts, chief, comm_rounds_global, mute)
                 print("Converged after:  ", len(episode_rewards), "episodes")
                 print("Agent total steps:", t)
                 print("Global steps:     ", debug['t_global']()[0])
@@ -319,20 +340,23 @@ def main(_):
                                         [submits] = sync_opt['set_submit']([0])
                                         while worker_count != sync_workers:
                                             if sync_opt['check_converged']()[0]:
-                                                print("Other worker converged! Finishing in check_wc")
+                                                if not mute:
+                                                    print("Other worker converged! Finishing in check_wc")
                                                 break
                                             worker_count = sync_opt['check_wc']()[0]
 
                                     while sync_opt['check_submit']()[0] == -1:
                                         if sync_opt['check_converged']()[0]:
-                                            print("Other worker converged! Finishing in check_submit")
+                                            if not mute:
+                                                print("Other worker converged! Finishing in check_submit")
                                             break
                                         # print("Waiting for submit to start")
                                         # time.sleep(0.1)
                                         pass
 
                                     if sync_opt['check_converged']()[0]:
-                                        print("Other worker converged! Continuing before submit")
+                                        if not mute:
+                                            print("Other worker converged! Continuing before submit")
                                         continue
 
                                     # Now all eligible workers have sent their score and gradient round has started
@@ -350,7 +374,8 @@ def main(_):
                                     if chief:
                                         while not sync_opt['check_submit']()[0] == sync_workers:
                                             if sync_opt['check_converged']()[0]:
-                                                print("Other worker converged! Finishing in check_submit (chief)")
+                                                if not mute:
+                                                    print("Other worker converged! Finishing in check_submit (chief)")
                                                 break
                                             # print("Chief waiting for all submits", sync_opt['check_submit']()[0], "!=", sync_workers)
                                             #time.sleep(5)
@@ -368,7 +393,8 @@ def main(_):
                                     if not chief:
                                         while sync_opt['check_round']()[0] <= comm_rounds:
                                             if sync_opt['check_converged']()[0]:
-                                                print("Other worker converged! Finishing in check_round")
+                                                if not mute:
+                                                    print("Other worker converged! Finishing in check_round")
                                                 break
                                             # print("Worker submitted, waiting for next round:", comm_rounds + 1)
                                             # time.sleep(0.1)
@@ -376,15 +402,17 @@ def main(_):
 
                                 else: #elif worker_count > sync_workers:
                                     # If not allowed to submit score, wait for next round to start
-                                    print("Worker finished too late but before new round started (", comm_rounds_global, ")")
-                                    print("WC(", worker_count, ") > N(", sync_workers, ")", sep="")
+                                    if not mute:
+                                        print("Worker finished too late but before new round started (", comm_rounds_global, ")")
+                                        print("WC(", worker_count, ") > N(", sync_workers, ")", sep="")
                                     target = np.floor(comm_rounds_global + 1)  # +1 if x.0, +0.5 if x.5
                                     while not sync_opt['check_round']()[0] >= target:
                                         pass
 
                             elif comm_rounds_global > comm_rounds:
                                 # This means the worker is behind. Do nothing and start next round
-                                print("Communication round ", comm_rounds, "missed. Actual round:", comm_rounds_global)
+                                if not mute:
+                                    print("Communication round ", comm_rounds, "missed. Actual round:", comm_rounds_global)
                                 # TODO How to handle round count when skipping rounds?
                                 comm_rounds = comm_rounds_global - 1
 
@@ -411,7 +439,7 @@ def main(_):
                 if t % target_update == 0:
                     update_target()
 
-            if done and len(episode_rewards) % 10 == 0:
+            if not mute and done and len(episode_rewards) % 10 == 0:
                 last_rewards = episode_rewards[-101:-1]
                 logger.record_tabular("steps", t)
                 logger.record_tabular("global steps", debug['t_global']()[0])
@@ -469,6 +497,12 @@ if __name__ == "__main__":
         "--seed",
         type=int,
         help="Seed for randomness (reproducibility)"
+    )
+    parser.add_argument(
+        "--mute",
+        type=bool,
+        default=False,
+        help="Reduce spam"
     )
     FLAGS, unparsed = parser.parse_known_args()
     print("Unparsed:", unparsed)

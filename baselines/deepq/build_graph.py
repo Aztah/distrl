@@ -236,7 +236,7 @@ def build_train(make_obs_ph, q_func, num_actions, optimizer, chief=False, server
                             tf.get_variable(name=name, shape=var.shape, dtype=var.dtype,
                                             initializer=tf.contrib.layers.xavier_initializer(seed=1, dtype=var.dtype)))
             # global_q_func_vars = U.scope_vars(U.absolute_scope_name("global_weights"))
-            print("Global:", global_q_func_vars)
+            # print("Global:", global_q_func_vars)
 
             # old weights (used to implicitly calculate gradient sum: q_func_vars - q_func_vars_old)
             q_func_vars_old = []
@@ -248,7 +248,7 @@ def build_train(make_obs_ph, q_func, num_actions, optimizer, chief=False, server
                                         initializer=tf.contrib.layers.xavier_initializer(seed=1, dtype=var.dtype)))
             # q_old = q_func(obs_t_input.get(), num_actions, scope="old_weights")
             # q_func_vars_old = U.scope_vars(U.absolute_scope_name("old_weights"))
-            print("Old vars:", q_func_vars_old)
+            # print("Old vars:", q_func_vars_old)
 
             # q scores for actions which we know were selected in the given state.
             q_t_selected = tf.reduce_sum(q_t * tf.one_hot(act_t_ph, num_actions), 1)
