@@ -421,6 +421,7 @@ def main(_):
                                 time.sleep(5)
 
                         else:
+                            sync_opt['inc_comm_round']()
                             [[dt], [comm_rounds_global], [factor]] = global_opt([t - t_start], [t_global_old], [0], [-1], [False])
 
                         # Update the local weights with the new global weights from PS
