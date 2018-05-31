@@ -1,5 +1,7 @@
-# distrl
-Distributed Reinforcement Learning
+# FADQN
+Federated Averaging Deep Q-Network
+
+A distributed Reinforcement Learning framework
 
 ## Installation ##
 * Install Anaconda
